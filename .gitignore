@@ -10,6 +10,8 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+cover.out
+cover.html
 
 # IDE-specific files
 .idea/
@@ -19,12 +21,20 @@
 *.njsproj
 *.sln
 *.sw?
+*.swp
 
 # Log files
 *.log
 
 # Environment variables
 .env
+.env.local
+*.local.env
 
 # Compiled binary
 /app
+/bin/
+
+# OS
+.DS_Store
+Thumbs.db
