@@ -11,4 +11,13 @@ var (
 
 	// ErrForbidden — операция запрещена (например, удаление чужого аватара).
 	ErrForbidden = errors.New("domain: forbidden")
+
+	// ErrInvalidFormat — файл не прошёл валидацию (MIME-тип или сигнатура).
+	ErrInvalidFormat = errors.New("domain: invalid format")
+
+	// ErrFileTooLarge — размер файла превышает допустимый предел.
+	ErrFileTooLarge = errors.New("domain: file too large")
+
+	// ErrNotImplemented — операция ещё не реализована (например, ресайз).
+	ErrNotImplemented = errors.New("domain: not implemented")
 )
