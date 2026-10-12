@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/b602op/avatars-service/internal/httpx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
@@ -20,7 +21,7 @@ func newTestRouter() *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(UserID())
 	r.Get("/protected", func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := UserIDFromContext(r.Context())
+		userID, ok := httpx.UserIDFromContext(r.Context())
 		if !ok {
 			http.Error(w, "no userID", http.StatusInternalServerError)
 			return

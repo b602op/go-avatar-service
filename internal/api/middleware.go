@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/b602op/avatars-service/internal/httpx"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
@@ -71,7 +72,7 @@ func UserID() func(http.Handler) http.Handler {
 				writeJSONError(w, http.StatusBadRequest, "invalid X-User-ID")
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(WithUserID(r.Context(), userID)))
+			next.ServeHTTP(w, r.WithContext(httpx.WithUserID(r.Context(), userID)))
 		})
 	}
 }

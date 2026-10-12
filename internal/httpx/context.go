@@ -1,4 +1,8 @@
-package api
+// Package httpx содержит общие утилиты HTTP-транспорта.
+//
+// Хелперы контекста вынесены в отдельный пакет, чтобы их могли использовать и
+// middleware (internal/api), и хендлеры (internal/handlers) без импортного цикла.
+package httpx
 
 import "context"
 
