@@ -73,8 +73,17 @@ func main() {
 	}
 	log.Info("s3 bucket ready", "bucket", cfg.S3.Bucket)
 
-	// Паблишер событий: no-op до ШАГА 7 (RabbitMQ).
-	pub := publisher.NewNoop(log)
+	// Паблишер событий: реальный RabbitMQ.
+	pub, err := publisher.NewRabbitMQ(cfg.RabbitMQ, log)
+	if err != nil {
+		log.Error("failed to create publisher", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := pub.Close(); err != nil {
+			log.Error("failed to close publisher", "error", err)
+		}
+	}()
 
 	// Сборка слоёв: репозиторий → сервис → хендлер → роутер.
 	repo := postgres.NewAvatarRepository(pool)

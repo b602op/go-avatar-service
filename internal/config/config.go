@@ -60,6 +60,11 @@ type S3Config struct {
 type RabbitMQConfig struct {
 	URL      string
 	Exchange string
+
+	// RetryTTL — сколько сообщение лежит в retry-очереди перед возвратом в
+	// основную. Ноль означает значение по умолчанию (publisher.DefaultRetryTTL).
+	// Вынесено в конфиг, чтобы интеграционные тесты могли использовать короткий TTL.
+	RetryTTL time.Duration
 }
 
 // Load читает конфигурацию из переменных окружения и валидирует её.

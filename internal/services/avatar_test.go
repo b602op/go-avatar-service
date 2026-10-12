@@ -85,22 +85,60 @@ func TestAvatarService_Upload_StorageFails(t *testing.T) {
 	assert.Zero(t, pub.uploadedCount)
 }
 
-func TestAvatarService_GetContent_Original_Success(t *testing.T) {
+func TestAvatarService_GetContent_Original(t *testing.T) {
+	// Пустой size и "original" — одно и то же: отдаём оригинал.
+	for _, size := range []string{"", sizeOriginal} {
+		t.Run("size="+size, func(t *testing.T) {
+			avatar := &domain.Avatar{
+				ID:       uuid.New(),
+				UserID:   "user-1",
+				MimeType: mimeJPEG,
+				S3Key:    "originals/user-1/x/photo.jpg",
+				ThumbnailS3Keys: map[string]string{
+					"100x100": "thumbnails/user-1/x/100x100.jpg",
+				},
+			}
+			repo := &stubAvatarRepo{
+				getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
+					return avatar, nil
+				},
+			}
+			body := io.NopCloser(strings.NewReader("content"))
+			storage := &stubObjectStorage{
+				downloadFn: func(_ context.Context, key string) (io.ReadCloser, *domain.ObjectInfo, error) {
+					assert.Equal(t, avatar.S3Key, key)
+					// ContentType пустой — сервис обязан подставить его сам.
+					return body, &domain.ObjectInfo{Key: key, Size: 7}, nil
+				},
+			}
+			svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+
+			rc, info, err := svc.GetContent(context.Background(), avatar.ID, size)
+			require.NoError(t, err)
+			defer func() { _ = rc.Close() }()
+
+			assert.Equal(t, int64(7), info.Size)
+			assert.Equal(t, mimeJPEG, info.ContentType)
+		})
+	}
+}
+
+func TestAvatarService_GetContent_KeepsStorageContentType(t *testing.T) {
 	avatar := &domain.Avatar{
-		ID:     uuid.New(),
-		UserID: "user-1",
-		S3Key:  "originals/user-1/x/photo.jpg",
+		ID:       uuid.New(),
+		UserID:   "user-1",
+		MimeType: mimeJPEG,
+		S3Key:    "originals/user-1/x/photo.jpg",
 	}
 	repo := &stubAvatarRepo{
 		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
 			return avatar, nil
 		},
 	}
-	body := io.NopCloser(strings.NewReader("content"))
 	storage := &stubObjectStorage{
 		downloadFn: func(_ context.Context, key string) (io.ReadCloser, *domain.ObjectInfo, error) {
-			assert.Equal(t, avatar.S3Key, key)
-			return body, &domain.ObjectInfo{Key: key, Size: 7}, nil
+			return io.NopCloser(strings.NewReader("content")),
+				&domain.ObjectInfo{Key: key, Size: 7, ContentType: "image/png"}, nil
 		},
 	}
 	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
@@ -109,21 +147,82 @@ func TestAvatarService_GetContent_Original_Success(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rc.Close() }()
 
-	assert.Equal(t, int64(7), info.Size)
+	// MIME из хранилища приоритетнее: подстановка нужна только как fallback.
+	assert.Equal(t, "image/png", info.ContentType)
 }
 
-func TestAvatarService_GetContent_Resize_NotImplemented(t *testing.T) {
-	avatar := &domain.Avatar{ID: uuid.New(), UserID: "user-1", S3Key: "originals/user-1/x/photo.jpg"}
+func TestAvatarService_GetContent_Thumbnail(t *testing.T) {
+	avatar := &domain.Avatar{
+		ID:       uuid.New(),
+		UserID:   "user-1",
+		MimeType: mimeJPEG,
+		S3Key:    "originals/user-1/x/photo.jpg",
+		ThumbnailS3Keys: map[string]string{
+			"100x100": "thumbnails/user-1/x/100x100.jpg",
+			"300x300": "thumbnails/user-1/x/300x300.jpg",
+		},
+	}
 	repo := &stubAvatarRepo{
 		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
 			return avatar, nil
 		},
 	}
-	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+	body := io.NopCloser(strings.NewReader("thumb"))
+	storage := &stubObjectStorage{
+		downloadFn: func(_ context.Context, key string) (io.ReadCloser, *domain.ObjectInfo, error) {
+			assert.Equal(t, "thumbnails/user-1/x/100x100.jpg", key)
+			return body, &domain.ObjectInfo{Key: key, Size: 5}, nil
+		},
+	}
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
 
-	_, _, err := svc.GetContent(context.Background(), avatar.ID, "100x100")
+	rc, info, err := svc.GetContent(context.Background(), avatar.ID, "100x100")
+	require.NoError(t, err)
+	defer func() { _ = rc.Close() }()
+
+	assert.Equal(t, int64(5), info.Size)
+	// Миниатюры всегда JPEG, даже если mime_type оригинала другой.
+	assert.Equal(t, "image/jpeg", info.ContentType)
+}
+
+func TestAvatarService_GetContent_UnknownSize(t *testing.T) {
+	avatar := &domain.Avatar{
+		ID:     uuid.New(),
+		UserID: "user-1",
+		S3Key:  "originals/user-1/x/photo.jpg",
+		ThumbnailS3Keys: map[string]string{
+			"100x100": "thumbnails/user-1/x/100x100.jpg",
+		},
+	}
+	repo := &stubAvatarRepo{
+		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
+			return avatar, nil
+		},
+	}
+	storage := &stubObjectStorage{
+		downloadFn: func(context.Context, string) (io.ReadCloser, *domain.ObjectInfo, error) {
+			t.Fatal("download не должен вызываться для неизвестного размера")
+			return nil, nil, nil
+		},
+	}
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+
+	_, _, err := svc.GetContent(context.Background(), avatar.ID, "500x500")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, domain.ErrNotImplemented)
+}
+
+func TestAvatarService_GetContent_NotFound(t *testing.T) {
+	repo := &stubAvatarRepo{
+		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
+			return nil, domain.ErrNotFound
+		},
+	}
+	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+
+	_, _, err := svc.GetContent(context.Background(), uuid.New(), sizeOriginal)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
 func TestAvatarService_Delete_Success(t *testing.T) {
@@ -151,17 +250,17 @@ func TestAvatarService_Delete_Success(t *testing.T) {
 	// Soft-delete выполнен.
 	assert.Contains(t, repo.softDeleted, avatar.ID)
 
-	// Удалены оригинал и обе миниатюры.
+	// S3 в Delete не трогаем: очистка асинхронная, через воркер.
+	assert.Empty(t, storage.deletedKeys)
+
+	// Событие об удалении опубликовано с ключами оригинала и миниатюр.
+	assert.Equal(t, 1, pub.deletedCount)
+	assert.Equal(t, avatar.ID, pub.deletedID)
 	assert.ElementsMatch(t, []string{
 		"originals/user-1/a1/photo.jpg",
 		"thumbnails/user-1/a1/100x100.jpg",
 		"thumbnails/user-1/a1/300x300.jpg",
-	}, storage.deletedKeys)
-
-	// Событие об удалении опубликовано.
-	assert.Equal(t, 1, pub.deletedCount)
-	assert.Equal(t, avatar.ID, pub.deletedID)
-	assert.ElementsMatch(t, storage.deletedKeys, pub.deletedKeys)
+	}, pub.deletedKeys)
 }
 
 func TestAvatarService_Delete_Forbidden(t *testing.T) {
@@ -172,14 +271,16 @@ func TestAvatarService_Delete_Forbidden(t *testing.T) {
 		},
 	}
 	storage := &stubObjectStorage{}
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+	pub := &stubEventPublisher{}
+	svc := NewAvatarService(repo, storage, pub, nil)
 
 	err := svc.Delete(context.Background(), avatar.ID, "user-2")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, domain.ErrForbidden)
 
-	// Чужой аватар не удаляется: ни в БД, ни в S3.
+	// Чужой аватар не удаляется: ни в БД, ни событие не публикуется.
 	assert.Empty(t, repo.softDeleted)
+	assert.Zero(t, pub.deletedCount)
 	assert.Empty(t, storage.deletedKeys)
 }
 
@@ -197,25 +298,28 @@ func TestAvatarService_Delete_NotFound(t *testing.T) {
 	assert.Empty(t, repo.softDeleted)
 }
 
-func TestAvatarService_Delete_StorageDeleteFails(t *testing.T) {
-	storageErr := errors.New("s3 unavailable")
+func TestAvatarService_Delete_PublishFails(t *testing.T) {
+	pubErr := errors.New("rabbitmq unavailable")
 	avatar := &domain.Avatar{ID: uuid.New(), UserID: "user-1", S3Key: "originals/user-1/a1/photo.jpg"}
 	repo := &stubAvatarRepo{
 		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
 			return avatar, nil
 		},
 	}
-	storage := &stubObjectStorage{
-		deleteManyFn: func(context.Context, []string) error {
-			return storageErr
+	storage := &stubObjectStorage{}
+	pub := &stubEventPublisher{
+		deletedFn: func(context.Context, uuid.UUID, string, []string) error {
+			return pubErr
 		},
 	}
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, storage, pub, nil)
 
 	err := svc.Delete(context.Background(), avatar.ID, "user-1")
 	require.Error(t, err)
-	assert.ErrorIs(t, err, storageErr)
+	assert.ErrorIs(t, err, pubErr)
 
-	// Soft-delete в БД уже сделан: запись помечена удалённой до сбоя очистки S3.
+	// Soft-delete уже сделан; S3 не трогаем — запись останется «зависшей»
+	// и будет подобрана cleanup-воркером (outbox-lite).
 	assert.Contains(t, repo.softDeleted, avatar.ID)
+	assert.Empty(t, storage.deletedKeys)
 }

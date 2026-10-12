@@ -17,6 +17,13 @@ import (
 // sizeOriginal — значение параметра size, означающее выдачу оригинала.
 const sizeOriginal = "original"
 
+// contentTypeJPEG — MIME миниатюр: ресайзер всегда кодирует их в JPEG.
+const contentTypeJPEG = "image/jpeg"
+
+// defaultContentType применяется, когда MIME не удалось определить ни по
+// запрошенному размеру, ни по данным в БД.
+const defaultContentType = "application/octet-stream"
+
 // AvatarService реализует бизнес-логику работы с аватарками.
 //
 // Слой полностью изолирован от HTTP и брокера: хендлеры вызывают только методы
@@ -111,8 +118,10 @@ func (s *AvatarService) ListByUserID(ctx context.Context, userID string) ([]*dom
 
 // GetContent возвращает содержимое аватарки.
 //
-// size == "" или "original" отдаёт оригинал из S3; любой другой размер пока не
-// поддерживается и даёт domain.ErrNotImplemented (хендлер вернёт 501).
+// size == "" или "original" отдаёт оригинал из S3; "100x100" и "300x300" —
+// готовые миниатюры, созданные воркером. Любой другой размер миниатюр
+// не поддерживается (ресайза на лету нет) и даёт domain.ErrNotImplemented —
+// хендлер вернёт 501.
 func (s *AvatarService) GetContent(
 	ctx context.Context,
 	id uuid.UUID,
@@ -123,26 +132,64 @@ func (s *AvatarService) GetContent(
 		return nil, nil, err
 	}
 
-	s.log.Info("content requested", "avatar_id", id, "size", size)
-
-	if size != "" && size != sizeOriginal {
-		return nil, nil, fmt.Errorf("%w: size %q", domain.ErrNotImplemented, size)
+	key, err := contentKey(avatar, size)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	s.log.Debug("downloading original", "avatar_id", id, "key", avatar.S3Key)
-	rc, info, err := s.storage.Download(ctx, avatar.S3Key)
+	s.log.Info("content requested", "avatar_id", id, "size", size)
+	s.log.Debug("downloading content", "avatar_id", id, "key", key)
+
+	rc, info, err := s.storage.Download(ctx, key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("services: download content: %w", err)
 	}
+
+	// S3 не всегда хранит Content-Type объекта — подставляем его сами,
+	// иначе хендлер отправит пустой заголовок и клиент не распознает картинку.
+	if info.ContentType == "" {
+		info.ContentType = contentTypeFor(avatar, size)
+	}
+
 	return rc, info, nil
 }
 
-// Delete мягко удаляет аватарку и очищает её файлы в S3.
+// contentKey определяет S3-ключ для запрошенного размера.
+//
+// Возвращает domain.ErrNotImplemented, если миниатюры такого размера нет:
+// она не создавалась воркером.
+func contentKey(avatar *domain.Avatar, size string) (string, error) {
+	if size == "" || size == sizeOriginal {
+		return avatar.S3Key, nil
+	}
+
+	key, ok := avatar.ThumbnailS3Keys[size]
+	if !ok {
+		return "", fmt.Errorf("%w: size %q", domain.ErrNotImplemented, size)
+	}
+	return key, nil
+}
+
+// contentTypeFor подбирает MIME, когда хранилище его не вернуло.
+//
+// Оригинал отдаётся в исходном формате загрузки (mime_type из БД), миниатюры —
+// всегда JPEG.
+func contentTypeFor(avatar *domain.Avatar, size string) string {
+	if size == "" || size == sizeOriginal {
+		if avatar.MimeType != "" {
+			return avatar.MimeType
+		}
+		return defaultContentType
+	}
+	return contentTypeJPEG
+}
+
+// Delete мягко удаляет аватарку и публикует событие на очистку файлов в S3.
 //
 // Удалять может только владелец: чужой аватар даёт domain.ErrForbidden.
-// Сначала выполняется soft-delete в БД, затем удаление объектов в S3: если S3
-// недоступен, запись в БД уже помечена удалённой, но ошибка возвращается наверх
-// (на ШАГЕ 7 очистку S3 перенесём в асинхронный воркер с retry).
+// Очистка объектов в S3 выполняется асинхронно воркером по событию
+// avatar.deleted: если S3 недоступен, consumer переотправит сообщение (retry).
+// Поэтому сам метод не трогает storage — только БД и брокер.
 func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID string) error {
 	avatar, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -158,11 +205,6 @@ func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID st
 	}
 
 	keys := collectS3Keys(avatar)
-	if err := s.storage.DeleteMany(ctx, keys); err != nil {
-		s.log.Warn("failed to delete avatar objects", "avatar_id", id, "error", err)
-		return fmt.Errorf("services: delete avatar objects: %w", err)
-	}
-
 	if err := s.publisher.PublishAvatarDeleted(ctx, id, avatar.UserID, keys); err != nil {
 		return fmt.Errorf("services: publish avatar deleted: %w", err)
 	}

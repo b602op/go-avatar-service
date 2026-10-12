@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -78,6 +79,7 @@ func newAvatarRouter(h *AvatarHandler) *chi.Mux {
 	r := chi.NewRouter()
 	r.Post("/avatars", h.Upload)
 	r.Get("/avatars/{avatar_id}", h.GetByID)
+	r.Get("/avatars/{avatar_id}/content", h.GetContent)
 	r.Get("/avatars/{avatar_id}/metadata", h.Metadata)
 	r.Delete("/avatars/{avatar_id}", h.Delete)
 	r.Get("/users/{user_id}/avatar", h.GetUserAvatar)
@@ -337,6 +339,111 @@ func TestAvatarHandler_ListByUser_Success(t *testing.T) {
 	var resp []AvatarResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	require.Len(t, resp, 2)
+}
+
+// ─── GetContent ─────────────────────────────────────────────────────────────
+
+// contentStub — стаб сервиса, отдающий заданные байты и метаданные.
+func contentStub(t *testing.T, wantSize, contentType, etag string, body []byte) *stubAvatarService {
+	t.Helper()
+	return &stubAvatarService{
+		getContentFn: func(_ context.Context, _ uuid.UUID, size string) (io.ReadCloser, *domain.ObjectInfo, error) {
+			assert.Equal(t, wantSize, size)
+			return io.NopCloser(bytes.NewReader(body)), &domain.ObjectInfo{
+				Size:        int64(len(body)),
+				ContentType: contentType,
+				ETag:        etag,
+			}, nil
+		},
+	}
+}
+
+func TestAvatarHandler_GetContent_Original(t *testing.T) {
+	body := []byte("original-bytes")
+	svc := contentStub(t, sizeOriginal, "image/jpeg", "abc123", body)
+	router := newAvatarRouter(newTestHandler(svc))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+uuid.NewString()+"/content?size=original", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "image/jpeg", rec.Header().Get("Content-Type"))
+	assert.Equal(t, strconv.Itoa(len(body)), rec.Header().Get("Content-Length"))
+	assert.Equal(t, contentCacheControl, rec.Header().Get("Cache-Control"))
+	assert.Equal(t, `"abc123"`, rec.Header().Get("ETag"))
+	assert.Equal(t, body, rec.Body.Bytes())
+}
+
+func TestAvatarHandler_GetContent_DefaultSizeIsOriginal(t *testing.T) {
+	svc := contentStub(t, sizeOriginal, "image/jpeg", "", []byte("x"))
+	router := newAvatarRouter(newTestHandler(svc))
+
+	// Без параметра size сервис должен получить "original".
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+uuid.NewString()+"/content", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	// ETag пустой — заголовок не выставляем, чтобы не отдавать ETag: "".
+	assert.Empty(t, rec.Header().Get("ETag"))
+}
+
+func TestAvatarHandler_GetContent_Thumbnail(t *testing.T) {
+	body := []byte("thumb-bytes")
+	svc := contentStub(t, "100x100", "image/jpeg", "thumb-etag", body)
+	router := newAvatarRouter(newTestHandler(svc))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+uuid.NewString()+"/content?size=100x100", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "image/jpeg", rec.Header().Get("Content-Type"))
+	assert.Equal(t, body, rec.Body.Bytes())
+}
+
+func TestAvatarHandler_GetContent_NotImplemented(t *testing.T) {
+	svc := &stubAvatarService{
+		getContentFn: func(context.Context, uuid.UUID, string) (io.ReadCloser, *domain.ObjectInfo, error) {
+			return nil, nil, domain.ErrNotImplemented
+		},
+	}
+	router := newAvatarRouter(newTestHandler(svc))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+uuid.NewString()+"/content?size=500x500", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
+	assert.JSONEq(t, `{"error":"Not Implemented","details":"available sizes: original, 100x100, 300x300"}`, rec.Body.String())
+}
+
+func TestAvatarHandler_GetContent_NotFound(t *testing.T) {
+	svc := &stubAvatarService{
+		getContentFn: func(context.Context, uuid.UUID, string) (io.ReadCloser, *domain.ObjectInfo, error) {
+			return nil, nil, domain.ErrNotFound
+		},
+	}
+	router := newAvatarRouter(newTestHandler(svc))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+uuid.NewString()+"/content", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	assert.JSONEq(t, `{"error":"Avatar not found"}`, rec.Body.String())
+}
+
+func TestAvatarHandler_GetContent_InvalidUUID(t *testing.T) {
+	router := newAvatarRouter(newTestHandler(&stubAvatarService{}))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/not-a-uuid/content", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.JSONEq(t, `{"error":"Invalid avatar ID"}`, rec.Body.String())
 }
 
 // ─── Delete ─────────────────────────────────────────────────────────────────

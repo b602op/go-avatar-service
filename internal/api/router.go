@@ -65,6 +65,7 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 
 		r.Post("/avatars", deps.AvatarHandler.Upload)
 		r.Get("/avatars/{avatar_id}", deps.AvatarHandler.GetByID)
+		r.Get("/avatars/{avatar_id}/content", deps.AvatarHandler.GetContent)
 		r.Get("/avatars/{avatar_id}/metadata", deps.AvatarHandler.Metadata)
 		r.Delete("/avatars/{avatar_id}", deps.AvatarHandler.Delete)
 

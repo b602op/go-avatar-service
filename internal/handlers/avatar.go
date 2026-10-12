@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -21,6 +22,14 @@ const maxMultipartMemory = 10 << 20
 
 // genericContentType — «неизвестный» MIME, который шлют curl -F и multipart.Writer.
 const genericContentType = "application/octet-stream"
+
+// sizeOriginal — значение параметра size, означающее выдачу оригинала.
+const sizeOriginal = "original"
+
+// contentCacheControl — заголовок кэширования для байтов аватарки.
+//
+// Содержимое неизменяемо (у аватарки свой ID), поэтому кэшируем на сутки.
+const contentCacheControl = "public, max-age=86400"
 
 // AvatarService описывает бизнес-операции над аватарками, нужные хендлерам.
 //
@@ -196,6 +205,46 @@ func (h *AvatarHandler) Metadata(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info("avatar metadata fetched", "avatar_id", id)
 	respondJSON(w, http.StatusOK, avatarToMetadata(avatar))
+}
+
+// GetContent обрабатывает GET /api/v1/avatars/{avatar_id}/content.
+//
+// Отдаёт байты аватарки: оригинал (size пусто или "original") либо готовую
+// миниатюру (size=100x100, size=300x300). Ресайза на лету нет — неизвестный
+// размер даёт 501 (domain.ErrNotImplemented).
+func (h *AvatarHandler) GetContent(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.parseAvatarID(w, r)
+	if !ok {
+		return
+	}
+
+	size := r.URL.Query().Get("size")
+	if size == "" {
+		size = sizeOriginal
+	}
+
+	reader, info, err := h.svc.GetContent(r.Context(), id, size)
+	if err != nil {
+		respondError(w, h.log, err)
+		return
+	}
+	defer func() { _ = reader.Close() }()
+
+	h.log.Info("avatar content served", "avatar_id", id, "size", size, "bytes", info.Size)
+
+	w.Header().Set("Content-Type", info.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	w.Header().Set("Cache-Control", contentCacheControl)
+	if info.ETag != "" {
+		w.Header().Set("ETag", `"`+info.ETag+`"`)
+	}
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.Copy(w, reader); err != nil {
+		// Ответ уже начал уходить: клиент мог отключиться или получить обрыв.
+		// Это не 5xx приложения — фиксируем в логе и завершаем обработку.
+		h.log.Warn("avatar content copy failed", "avatar_id", id, "size", size, "error", err)
+	}
 }
 
 // Delete обрабатывает DELETE /api/v1/avatars/{avatar_id}.

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/b602op/avatars-service/internal/domain"
 	"github.com/b602op/avatars-service/internal/services"
+	"github.com/b602op/avatars-service/pkg/resizer"
 )
 
 // contentTypeJSON — единый Content-Type для всех JSON-ответов.
@@ -71,9 +74,24 @@ func mapError(err error) (int, any) {
 	case errors.Is(err, domain.ErrNotImplemented):
 		return http.StatusNotImplemented, ErrorResponse{
 			Error:   "Not Implemented",
-			Details: "resizing will be available after step 7",
+			Details: availableSizes(),
 		}
 	default:
 		return http.StatusInternalServerError, ErrorResponse{Error: "Internal Server Error"}
 	}
+}
+
+// availableSizes перечисляет поддерживаемые значения параметра size для подсказки
+// в ответе 501: "original" плюс размеры миниатюр из ресайзера.
+//
+// Список строится из resizer.DefaultSizes, чтобы подсказка не расходилась с
+// реально создаваемыми миниатюрами.
+func availableSizes() string {
+	sizes := make([]string, 0, len(resizer.DefaultSizes))
+	for name := range resizer.DefaultSizes {
+		sizes = append(sizes, name)
+	}
+	sort.Strings(sizes)
+
+	return "available sizes: original, " + strings.Join(sizes, ", ")
 }
