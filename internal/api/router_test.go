@@ -1,0 +1,150 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// newTestRouter собирает защищённый роутер с хендлером, читающим userID из контекста.
+func newTestRouter() *chi.Mux {
+	r := chi.NewRouter()
+	r.Use(UserID())
+	r.Get("/protected", func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := UserIDFromContext(r.Context())
+		if !ok {
+			http.Error(w, "no userID", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(userID))
+	})
+	return r
+}
+
+func TestRouter_Health(t *testing.T) {
+	router := NewRouter(RouterDeps{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"status":"ok"}`, rec.Body.String())
+}
+
+func TestRouter_NotFound(t *testing.T) {
+	router := NewRouter(RouterDeps{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/unknown", nil))
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestRouter_StaticHTML(t *testing.T) {
+	// Статика раздаётся относительно корня проекта; из пакета internal/api
+	// рабочая директория — сам пакет, поэтому поднимаемся на два уровня.
+	t.Chdir("../../")
+
+	router := NewRouter(RouterDeps{})
+
+	// http.FileServer канонизирует путь .../index.html → .../ (301 Moved
+	// Permanently) — стандартное поведение net/http. Проверяем сам редирект.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web/static/index.html", nil))
+	require.Equal(t, http.StatusMovedPermanently, rec.Code)
+
+	// Канонический путь отдаёт страницу с кодом 200.
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web/static/", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "Avatar Upload Service")
+}
+
+func TestMiddleware_UserID_Valid(t *testing.T) {
+	router := newTestRouter()
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set(userIDHeader, "user-123")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "user-123", rec.Body.String())
+}
+
+func TestMiddleware_UserID_Missing(t *testing.T) {
+	router := newTestRouter()
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/protected", nil))
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.JSONEq(t, `{"error":"invalid X-User-ID"}`, rec.Body.String())
+}
+
+func TestMiddleware_UserID_TooLong(t *testing.T) {
+	router := newTestRouter()
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set(userIDHeader, strings.Repeat("a", maxUserIDLen+1))
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestMiddleware_UserID_InvalidChars(t *testing.T) {
+	router := newTestRouter()
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set(userIDHeader, "user@123")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestMiddleware_RequestLogger(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	router := chi.NewRouter()
+	router.Use(middleware.RequestID)
+	router.Use(RequestLogger(log))
+	router.Get("/ok", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	router.Get("/boom", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	// Успешный запрос логируется на уровне INFO.
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ok", nil))
+	var okEntry map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &okEntry))
+	assert.Equal(t, "INFO", okEntry["level"])
+	assert.Equal(t, "http request", okEntry["msg"])
+	assert.Equal(t, float64(http.StatusOK), okEntry["status"])
+
+	// Серверная ошибка — на уровне ERROR.
+	buf.Reset()
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/boom", nil))
+	var errEntry map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &errEntry))
+	assert.Equal(t, "ERROR", errEntry["level"])
+	assert.Equal(t, float64(http.StatusInternalServerError), errEntry["status"])
+}
