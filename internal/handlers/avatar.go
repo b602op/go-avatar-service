@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,14 +19,32 @@ import (
 // maxMultipartMemory — лимит памяти на разбор multipart-формы.
 const maxMultipartMemory = 10 << 20
 
+// genericContentType — «неизвестный» MIME, который шлют curl -F и multipart.Writer.
+const genericContentType = "application/octet-stream"
+
+// AvatarService описывает бизнес-операции над аватарками, нужные хендлерам.
+//
+// Интерфейс объявлен на стороне потребителя (идиоматичный Go): это позволяет
+// подменять сервис в тестах без реальных БД/S3. Реализация — *services.AvatarService.
+type AvatarService interface {
+	Upload(ctx context.Context, userID, fileName, contentType string, data []byte) (*domain.Avatar, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Avatar, error)
+	ListByUserID(ctx context.Context, userID string) ([]*domain.Avatar, error)
+	GetContent(ctx context.Context, id uuid.UUID, size string) (io.ReadCloser, *domain.ObjectInfo, error)
+	Delete(ctx context.Context, id uuid.UUID, requesterID string) error
+}
+
+// Проверка на этапе компиляции, что конкретный сервис реализует интерфейс.
+var _ AvatarService = (*services.AvatarService)(nil)
+
 // AvatarHandler — HTTP-обработчики REST API аватарок.
 type AvatarHandler struct {
-	svc *services.AvatarService
+	svc AvatarService
 	log *slog.Logger
 }
 
 // NewAvatarHandler создаёт хендлер аватарок.
-func NewAvatarHandler(svc *services.AvatarService, log *slog.Logger) *AvatarHandler {
+func NewAvatarHandler(svc AvatarService, log *slog.Logger) *AvatarHandler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -82,8 +101,11 @@ func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Определяем MIME: пустой заголовок ИЛИ generic octet-stream (так шлют curl -F
+	// и multipart.Writer) означают «тип неизвестен» — определяем по сигнатуре файла.
+	// Валидность всё равно проверит сервис по magic bytes.
 	contentType := header.Header.Get("Content-Type")
-	if contentType == "" {
+	if contentType == "" || contentType == genericContentType {
 		contentType = http.DetectContentType(data)
 	}
 

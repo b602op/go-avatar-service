@@ -19,9 +19,11 @@ const staticDir = "web/static"
 
 // RouterDeps — зависимости роутера.
 //
-// На 6.2 содержит только логгер; сервисы (аватарки) добавятся на 6.3.
+// Хендлер аватарок передаётся готовым (DI): создание сервиса и хендлера —
+// ответственность main.go, где собраны все зависимости.
 type RouterDeps struct {
-	Log *slog.Logger
+	Log           *slog.Logger
+	AvatarHandler *handlers.AvatarHandler
 }
 
 // NewRouter собирает Chi-роутер с middleware и маршрутами.
@@ -42,11 +44,29 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 
-	// Health-check — публичный маршрут (без X-User-ID).
+	// Публичные маршруты (без X-User-ID).
 	r.Get("/health", handlers.Health())
 
 	// Раздача статики веб-интерфейса.
 	r.Handle("/web/static/*", http.StripPrefix("/web/static/", http.FileServer(http.Dir(staticDir))))
+
+	// REST API под /api/v1: все маршруты требуют валидный X-User-ID.
+	//
+	// Маршруты регистрируются с полным относительным путём (а не вложенными
+	// r.Route со "/"), чтобы POST /api/v1/avatars работал без завершающего слэша —
+	// именно так его вызывает фронтенд (web/static/index.html).
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(UserID())
+
+		r.Post("/avatars", deps.AvatarHandler.Upload)
+		r.Get("/avatars/{avatar_id}", deps.AvatarHandler.GetByID)
+		r.Get("/avatars/{avatar_id}/metadata", deps.AvatarHandler.Metadata)
+		r.Delete("/avatars/{avatar_id}", deps.AvatarHandler.Delete)
+
+		r.Get("/users/{user_id}/avatar", deps.AvatarHandler.GetUserAvatar)
+		r.Delete("/users/{user_id}/avatar", deps.AvatarHandler.DeleteUserAvatar)
+		r.Get("/users/{user_id}/avatars", deps.AvatarHandler.ListByUser)
+	})
 
 	return r
 }

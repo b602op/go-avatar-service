@@ -2,19 +2,58 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/b602op/avatars-service/internal/httpx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/httpx"
 )
+
+// apiStubService — минимальный стаб handlers.AvatarService для тестов роутера.
+// Все операции возвращают ErrNotFound: проверяется маршрутизация, не бизнес-логика.
+type apiStubService struct{}
+
+func (apiStubService) Upload(context.Context, string, string, string, []byte) (*domain.Avatar, error) {
+	return nil, domain.ErrNotFound
+}
+
+func (apiStubService) GetByID(context.Context, uuid.UUID) (*domain.Avatar, error) {
+	return nil, domain.ErrNotFound
+}
+
+func (apiStubService) ListByUserID(context.Context, string) ([]*domain.Avatar, error) {
+	return nil, domain.ErrNotFound
+}
+
+func (apiStubService) GetContent(context.Context, uuid.UUID, string) (io.ReadCloser, *domain.ObjectInfo, error) {
+	return nil, nil, domain.ErrNotFound
+}
+
+func (apiStubService) Delete(context.Context, uuid.UUID, string) error {
+	return domain.ErrNotFound
+}
+
+// newRouterWithHandler собирает роутер с реальным хендлером на стабе сервиса.
+func newRouterWithHandler() *chi.Mux {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewRouter(RouterDeps{
+		Log:           log,
+		AvatarHandler: handlers.NewAvatarHandler(apiStubService{}, log),
+	})
+}
 
 // newTestRouter собирает защищённый роутер с хендлером, читающим userID из контекста.
 func newTestRouter() *chi.Mux {
@@ -148,4 +187,45 @@ func TestMiddleware_RequestLogger(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &errEntry))
 	assert.Equal(t, "ERROR", errEntry["level"])
 	assert.Equal(t, float64(http.StatusInternalServerError), errEntry["status"])
+}
+
+func TestRouter_APIRequiresUserID(t *testing.T) {
+	router := newRouterWithHandler()
+
+	// Без заголовка X-User-ID защищённый маршрут отдаёт 400 от middleware.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/avatars/"+uuid.NewString(), nil))
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.JSONEq(t, `{"error":"invalid X-User-ID"}`, rec.Body.String())
+}
+
+func TestRouter_APIAcceptsUserID(t *testing.T) {
+	router := newRouterWithHandler()
+
+	// С валидным X-User-ID запрос доходит до хендлера (стаб отдаёт ErrNotFound → 404).
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/avatars/"+uuid.NewString(), nil)
+	req.Header.Set(userIDHeader, "user-123")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.NotEqual(t, http.StatusBadRequest, rec.Code, "запрос не должен падать на валидации заголовка")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestRouter_UploadRouteContract(t *testing.T) {
+	router := newRouterWithHandler()
+
+	// Контракт фронтенда: POST /api/v1/avatars БЕЗ завершающего слэша.
+	// Проверяем, что маршрут существует и не редиректит (иначе был бы 301/404).
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/avatars", nil)
+	req.Header.Set(userIDHeader, "user-123")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.NotEqual(t, http.StatusNotFound, rec.Code, "маршрут POST /api/v1/avatars должен существовать")
+	assert.NotEqual(t, http.StatusMovedPermanently, rec.Code, "маршрут не должен редиректить на слэш")
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "пустое тело → 400 Invalid multipart form")
 }
