@@ -1,18 +1,32 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"net/http"
+	"log/slog"
+	"os"
+
+	"github.com/joho/godotenv"
+
+	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/pkg/logger"
 )
 
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Avatar Service is running!")
-	})
-
-	log.Println("Starting server on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal(err)
+	// .env необязателен: если файла нет — работаем с переменными окружения ОС.
+	// Если файл есть, но битый — падаем громко с понятной ошибкой.
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		slog.Error("failed to load .env file", "error", err)
+		os.Exit(1)
 	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	log := logger.New(cfg.App.LogLevel)
+	log.Info("starting server", "config", cfg.String())
+
+	// HTTP-сервер и роутер появятся на ШАГЕ 6.
+	os.Exit(0)
 }
