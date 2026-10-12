@@ -24,6 +24,8 @@ const staticDir = "web/static"
 type RouterDeps struct {
 	Log           *slog.Logger
 	AvatarHandler *handlers.AvatarHandler
+	// AllowedOrigins — список разрешённых Origin для CORS ("*" — все).
+	AllowedOrigins []string
 }
 
 // NewRouter собирает Chi-роутер с middleware и маршрутами.
@@ -37,17 +39,20 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 
 	// Порядок middleware: снаружи внутрь. RequestID — первым, чтобы request_id
 	// был доступен логгеру; Recoverer — внутри логгера, чтобы паника попала в лог
-	// как 500.
+	// как 500. CORS — последним: он ставит заголовки до ухода в хендлер.
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(RequestLogger(log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
+	r.Use(CORS(deps.AllowedOrigins))
 
 	// Публичные маршруты (без X-User-ID).
 	r.Get("/health", handlers.Health())
 
-	// Раздача статики веб-интерфейса.
+	// Веб-интерфейс.
+	r.Get("/web/upload", handlers.ServeUploadForm)
+	r.Get("/web/gallery/{user_id}", handlers.RedirectToGallery)
 	r.Handle("/web/static/*", http.StripPrefix("/web/static/", http.FileServer(http.Dir(staticDir))))
 
 	// REST API под /api/v1: все маршруты требуют валидный X-User-ID.

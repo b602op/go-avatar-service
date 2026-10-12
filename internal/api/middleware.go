@@ -24,6 +24,7 @@ var userIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 var (
 	_ func(http.Handler) http.Handler = RequestLogger(slog.Default())
 	_ func(http.Handler) http.Handler = UserID()
+	_ func(http.Handler) http.Handler = CORS([]string{"*"})
 )
 
 // RequestLogger логирует каждый HTTP-запрос.
@@ -83,6 +84,56 @@ func validUserID(userID string) bool {
 		return false
 	}
 	return userIDPattern.MatchString(userID)
+}
+
+// CORS добавляет заголовки Cross-Origin Resource Sharing.
+//
+// Если в allowedOrigins есть "*", разрешаются все источники; иначе — только
+// перечисленные. Preflight-запрос (OPTIONS) завершается 204 без тела.
+func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
+	allowAll := false
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			allowAll = true
+			break
+		}
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			allowed := allowAll || contains(allowedOrigins, origin)
+
+			if origin != "" && allowed {
+				if allowAll {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+				}
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-ID")
+				w.Header().Set("Access-Control-Max-Age", "86400")
+			}
+
+			// Preflight не идёт дальше по цепочке.
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// contains проверяет наличие строки в срезе.
+func contains(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }
 
 // writeJSONError отправляет JSON-ответ с ошибкой.

@@ -50,8 +50,9 @@ func (apiStubService) Delete(context.Context, uuid.UUID, string) error {
 func newRouterWithHandler() *chi.Mux {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewRouter(RouterDeps{
-		Log:           log,
-		AvatarHandler: handlers.NewAvatarHandler(apiStubService{}, log),
+		Log:            log,
+		AvatarHandler:  handlers.NewAvatarHandler(apiStubService{}, log),
+		AllowedOrigins: []string{"*"},
 	})
 }
 
