@@ -21,6 +21,11 @@ type AvatarRepository interface {
 	// UpdateProcessingStatus обновляет статус обработки и ключи миниатюр.
 	UpdateProcessingStatus(ctx context.Context, id uuid.UUID, status ProcessingStatus, thumbnailKeys map[string]string) error
 
+	// CompleteProcessing фиксирует успешное завершение обработки: статус
+	// completed, ключи миниатюр и размеры оригинала одним запросом.
+	// Возвращает ErrNotFound, если записи нет или она мягко удалена.
+	CompleteProcessing(ctx context.Context, id uuid.UUID, thumbnails map[string]string, width, height int) error
+
 	// UpdateUploadStatus обновляет только upload_status.
 	UpdateUploadStatus(ctx context.Context, id uuid.UUID, status UploadStatus) error
 

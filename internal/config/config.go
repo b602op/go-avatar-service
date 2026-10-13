@@ -97,6 +97,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
+	// Значение по умолчанию продублировано литералом: пакет config не может
+	// импортировать services/publisher (там обратный импорт config — цикл).
+	// Держим 30s синхронно с publisher.DefaultRetryTTL.
+	retryTTL, err := getEnvDuration("RABBITMQ_RETRY_TTL", 30*time.Second)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	cfg := &Config{
 		App: AppConfig{
@@ -127,6 +134,7 @@ func Load() (*Config, error) {
 		RabbitMQ: RabbitMQConfig{
 			URL:      requiredEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/", isProd),
 			Exchange: requiredEnv("RABBITMQ_EXCHANGE", "avatars.exchange", isProd),
+			RetryTTL: retryTTL,
 		},
 	}
 

@@ -92,6 +92,13 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 		return fmt.Errorf("worker: read original %q: %w", event.S3Key, err)
 	}
 
+	// Размеры оригинала читаем из заголовка до ресайза: декодируется только
+	// header, поэтому вызов дешёвый. Если файл битый — дальше идти незачем.
+	width, height, err := resizer.GetDimensions(data)
+	if err != nil {
+		return fmt.Errorf("worker: get dimensions: %w", err)
+	}
+
 	thumbs, err := h.resizer.ResizeBatch(data, resizer.DefaultSizes)
 	if err != nil {
 		return fmt.Errorf("worker: resize: %w", err)
@@ -106,11 +113,11 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 		thumbnails[size] = key
 	}
 
-	if err := h.repo.UpdateProcessingStatus(ctx, avatarID, domain.ProcessingStatusCompleted, thumbnails); err != nil {
-		return fmt.Errorf("worker: update processing status: %w", err)
+	if err := h.repo.CompleteProcessing(ctx, avatarID, thumbnails, width, height); err != nil {
+		return fmt.Errorf("worker: complete processing: %w", err)
 	}
 
-	h.log.Info("avatar processed", "avatar_id", avatarID, "thumbnails", len(thumbnails))
+	h.log.Info("avatar processed", "avatar_id", avatarID, "thumbnails", len(thumbnails), "width", width, "height", height)
 	return nil
 }
 

@@ -3,6 +3,7 @@ package resizer
 import (
 	"bytes"
 	"fmt"
+	"image"
 
 	"github.com/disintegration/imaging"
 
@@ -24,6 +25,19 @@ type Size struct {
 var DefaultSizes = map[string]Size{
 	"100x100": {Width: 100, Height: 100},
 	"300x300": {Width: 300, Height: 300},
+}
+
+// GetDimensions читает ширину и высоту изображения из его заголовка.
+//
+// Использует image.DecodeConfig: декодируется только header, а не всё
+// изображение, поэтому вызов дешёвый. Поддерживаемые форматы те же, что и у
+// Resize (JPEG, PNG, GIF, WebP).
+func GetDimensions(data []byte) (width, height int, err error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, fmt.Errorf("resizer: decode config: %w", err)
+	}
+	return cfg.Width, cfg.Height, nil
 }
 
 // Resize уменьшает изображение до рамки Width x Height и кодирует его в JPEG.

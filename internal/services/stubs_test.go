@@ -26,6 +26,7 @@ type stubAvatarRepo struct {
 	getByIDFn     func(ctx context.Context, id uuid.UUID) (*domain.Avatar, error)
 	listByUserFn  func(ctx context.Context, userID string) ([]*domain.Avatar, error)
 	updateProcFn  func(ctx context.Context, id uuid.UUID, status domain.ProcessingStatus, thumbs map[string]string) error
+	completeFn    func(ctx context.Context, id uuid.UUID, thumbs map[string]string, width, height int) error
 	updateUpFn    func(ctx context.Context, id uuid.UUID, status domain.UploadStatus) error
 	softDeleteFn  func(ctx context.Context, id uuid.UUID) error
 	listPendingFn func(ctx context.Context, olderThan time.Duration) ([]*domain.Avatar, error)
@@ -59,6 +60,13 @@ func (s *stubAvatarRepo) ListByUserID(ctx context.Context, userID string) ([]*do
 func (s *stubAvatarRepo) UpdateProcessingStatus(ctx context.Context, id uuid.UUID, status domain.ProcessingStatus, thumbs map[string]string) error {
 	if s.updateProcFn != nil {
 		return s.updateProcFn(ctx, id, status, thumbs)
+	}
+	return nil
+}
+
+func (s *stubAvatarRepo) CompleteProcessing(ctx context.Context, id uuid.UUID, thumbs map[string]string, width, height int) error {
+	if s.completeFn != nil {
+		return s.completeFn(ctx, id, thumbs, width, height)
 	}
 	return nil
 }

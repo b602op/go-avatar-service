@@ -120,6 +120,42 @@ func TestAvatarRepository_UpdateProcessingStatus_NotFound(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound)
 }
 
+func TestAvatarRepository_CompleteProcessing(t *testing.T) {
+	repo, _ := setupTest(t)
+	ctx := context.Background()
+
+	a := newAvatar("user-1")
+	require.NoError(t, repo.Create(ctx, a))
+
+	// Create не заполняет width/height — они остаются NULL.
+	before, err := repo.GetByID(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Nil(t, before.Width)
+	assert.Nil(t, before.Height)
+
+	thumbs := map[string]string{
+		"100x100": "thumbnails/" + a.ID.String() + "/100x100.jpg",
+		"300x300": "thumbnails/" + a.ID.String() + "/300x300.jpg",
+	}
+	require.NoError(t, repo.CompleteProcessing(ctx, a.ID, thumbs, 800, 600))
+
+	got, err := repo.GetByID(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ProcessingStatusCompleted, got.ProcessingStatus)
+	assert.Equal(t, thumbs, got.ThumbnailS3Keys)
+	require.NotNil(t, got.Width)
+	require.NotNil(t, got.Height)
+	assert.Equal(t, 800, *got.Width)
+	assert.Equal(t, 600, *got.Height)
+}
+
+func TestAvatarRepository_CompleteProcessing_NotFound(t *testing.T) {
+	repo, _ := setupTest(t)
+
+	err := repo.CompleteProcessing(context.Background(), uuid.New(), nil, 100, 100)
+	assert.ErrorIs(t, err, domain.ErrNotFound)
+}
+
 func TestAvatarRepository_SoftDelete(t *testing.T) {
 	repo, _ := setupTest(t)
 	ctx := context.Background()

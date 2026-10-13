@@ -16,7 +16,7 @@ var allEnvKeys = []string{
 	"HTTP_PORT", "HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT",
 	"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_SSLMODE",
 	"S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION", "S3_USE_SSL",
-	"RABBITMQ_URL", "RABBITMQ_EXCHANGE",
+	"RABBITMQ_URL", "RABBITMQ_EXCHANGE", "RABBITMQ_RETRY_TTL",
 }
 
 // clearEnv сбрасывает все переменные окружения, влияющие на Load.
@@ -58,6 +58,25 @@ func TestLoad_Defaults(t *testing.T) {
 
 	assert.Equal(t, "amqp://guest:guest@localhost:5672/", cfg.RabbitMQ.URL)
 	assert.Equal(t, "avatars.exchange", cfg.RabbitMQ.Exchange)
+	assert.Equal(t, 30*time.Second, cfg.RabbitMQ.RetryTTL)
+}
+
+func TestLoad_RabbitMQRetryTTL(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RABBITMQ_RETRY_TTL", "45s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, cfg.RabbitMQ.RetryTTL)
+}
+
+func TestLoad_RabbitMQRetryTTL_Invalid(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RABBITMQ_RETRY_TTL", "не-число")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RABBITMQ_RETRY_TTL")
 }
 
 func TestLoad_InvalidPort(t *testing.T) {

@@ -34,6 +34,8 @@ type Avatar struct {
 	SizeBytes        int64
 	S3Key            string            // ключ оригинала в S3
 	ThumbnailS3Keys  map[string]string // {"100x100": "thumbnails/...", "300x300": "..."}
+	Width            *int              // ширина оригинала; nil = ещё не вычислена
+	Height           *int              // высота оригинала; nil = ещё не вычислена
 	UploadStatus     UploadStatus
 	ProcessingStatus ProcessingStatus
 	CreatedAt        time.Time

@@ -23,20 +23,30 @@ import (
 
 // ─── стабы для быстрых тестов (без RabbitMQ) ────────────────────────────────
 
-// procUpdate — зафиксированный вызов UpdateProcessingStatus.
+// procUpdate — зафиксированный вызов обновления статуса обработки.
 type procUpdate struct {
 	id     uuid.UUID
 	status domain.ProcessingStatus
 }
 
-// stubRepo — минимальная реализация AvatarRepository; фиксирует вызовы GetByID
-// и UpdateProcessingStatus.
+// stubRepo — минимальная реализация AvatarRepository; фиксирует вызовы GetByID,
+// UpdateProcessingStatus и CompleteProcessing.
 type stubRepo struct {
 	getByIDFn     func(ctx context.Context, id uuid.UUID) (*domain.Avatar, error)
 	listPendingFn func(ctx context.Context, olderThan time.Duration) ([]*domain.Avatar, error)
 	updateProcFn  func(ctx context.Context, id uuid.UUID, status domain.ProcessingStatus) error
+	completeFn    func(ctx context.Context, id uuid.UUID, thumbs map[string]string, width, height int) error
 	calls         []uuid.UUID
 	procUpdates   []procUpdate
+	completes     []completeCall
+}
+
+// completeCall — зафиксированный вызов CompleteProcessing.
+type completeCall struct {
+	id     uuid.UUID
+	thumbs map[string]string
+	width  int
+	height int
 }
 
 func (s *stubRepo) Create(context.Context, *domain.Avatar) error { return nil }
@@ -55,6 +65,14 @@ func (s *stubRepo) UpdateProcessingStatus(ctx context.Context, id uuid.UUID, sta
 	s.procUpdates = append(s.procUpdates, procUpdate{id: id, status: status})
 	if s.updateProcFn != nil {
 		return s.updateProcFn(ctx, id, status)
+	}
+	return nil
+}
+
+func (s *stubRepo) CompleteProcessing(ctx context.Context, id uuid.UUID, thumbs map[string]string, width, height int) error {
+	s.completes = append(s.completes, completeCall{id: id, thumbs: thumbs, width: width, height: height})
+	if s.completeFn != nil {
+		return s.completeFn(ctx, id, thumbs, width, height)
 	}
 	return nil
 }
@@ -261,6 +279,8 @@ func queueCounter(t *testing.T) func(queue string) int {
 }
 
 // startConsumer запускает consumer в горутине и возвращает функцию остановки.
+//
+//nolint:revive // context-as-argument: в тестовых хелперах первым идёт *testing.T
 func startConsumer(t *testing.T, ctx context.Context, queue, retryKey string, handler MessageHandler) func() {
 	t.Helper()
 

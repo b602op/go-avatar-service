@@ -313,10 +313,65 @@ func TestAvatarHandler_Metadata_Success(t *testing.T) {
 	assert.Equal(t, "photo.jpg", resp.FileName)
 	assert.Equal(t, "image/jpeg", resp.MimeType)
 	assert.Equal(t, int64(len(jpegData)), resp.Size)
-	assert.Equal(t, 0, resp.Dimensions.Width)
-	assert.Equal(t, 0, resp.Dimensions.Height)
+	assert.Equal(t, "pending", resp.ProcessingStatus)
+	assert.Contains(t, rec.Body.String(), `"processing_status":"pending"`)
+
+	// Размеры ещё не вычислены (nil в домене) → поля нет в JSON вовсе.
+	assert.Nil(t, resp.Dimensions)
+	assert.NotContains(t, rec.Body.String(), "dimensions")
+
 	require.Len(t, resp.Thumbnails, 2)
 	assert.Equal(t, "100x100", resp.Thumbnails[0].Size)
+}
+
+func TestAvatarHandler_Metadata_WithDimensions(t *testing.T) {
+	avatar := sampleAvatar()
+	width, height := 800, 600
+	avatar.Width = &width
+	avatar.Height = &height
+	avatar.ProcessingStatus = domain.ProcessingStatusCompleted
+
+	svc := &stubAvatarService{
+		getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
+			return avatar, nil
+		},
+	}
+	router := newAvatarRouter(newTestHandler(svc))
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/avatars/"+avatar.ID.String()+"/metadata", nil), "user-123")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp MetadataResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "completed", resp.ProcessingStatus)
+	require.NotNil(t, resp.Dimensions)
+	assert.Equal(t, 800, resp.Dimensions.Width)
+	assert.Equal(t, 600, resp.Dimensions.Height)
+	assert.JSONEq(t, `{"width":800,"height":600}`, mustJSON(t, resp.Dimensions))
+}
+
+// mustJSON сериализует значение в JSON-строку (для точечных проверок).
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return string(b)
+}
+
+// TestAvatarToMetadata_PartialDimensions: пока известна только одна сторона,
+// размеры считаются неготовыми и в ответ не попадают.
+func TestAvatarToMetadata_PartialDimensions(t *testing.T) {
+	avatar := sampleAvatar()
+	width := 800
+	avatar.Width = &width // Height == nil
+
+	assert.Nil(t, avatarToMetadata(avatar).Dimensions)
+
+	avatar.Height = &width
+	require.NotNil(t, avatarToMetadata(avatar).Dimensions)
 }
 
 // ─── ListByUser ─────────────────────────────────────────────────────────────

@@ -92,6 +92,47 @@ func TestResize_AspectRatio_500x300_To_100x100(t *testing.T) {
 	assert.Equal(t, 60, h)
 }
 
+func TestGetDimensions_JPEG(t *testing.T) {
+	src := makeTestImage(t, 800, 600, imaging.JPEG)
+
+	w, h, err := GetDimensions(src)
+	require.NoError(t, err)
+	assert.Equal(t, 800, w)
+	assert.Equal(t, 600, h)
+}
+
+func TestGetDimensions_PNG(t *testing.T) {
+	src := makeTestImage(t, 123, 456, imaging.PNG)
+
+	w, h, err := GetDimensions(src)
+	require.NoError(t, err)
+	assert.Equal(t, 123, w)
+	assert.Equal(t, 456, h)
+}
+
+func TestGetDimensions_WebP(t *testing.T) {
+	src, err := base64.StdEncoding.DecodeString(webpFixtureB64)
+	require.NoError(t, err)
+
+	// Фикстура — WebP 200x150.
+	w, h, err := GetDimensions(src)
+	require.NoError(t, err)
+	assert.Equal(t, 200, w)
+	assert.Equal(t, 150, h)
+}
+
+func TestGetDimensions_InvalidData(t *testing.T) {
+	_, _, err := GetDimensions([]byte("not an image"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resizer: decode config")
+}
+
+func TestGetDimensions_EmptyData(t *testing.T) {
+	_, _, err := GetDimensions(nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resizer: decode config")
+}
+
 func TestResize_InvalidData(t *testing.T) {
 	_, err := Resize([]byte("not an image"), 100, 100)
 	require.Error(t, err)

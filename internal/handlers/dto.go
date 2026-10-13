@@ -48,15 +48,16 @@ type Dimensions struct {
 
 // MetadataResponse — метаданные аватарки.
 type MetadataResponse struct {
-	ID         string          `json:"id"`
-	UserID     string          `json:"user_id"`
-	FileName   string          `json:"file_name"`
-	MimeType   string          `json:"mime_type"`
-	Size       int64           `json:"size"`
-	Dimensions Dimensions      `json:"dimensions"`
-	Thumbnails []ThumbnailInfo `json:"thumbnails"`
-	CreatedAt  time.Time       `json:"created_at"`
-	UpdatedAt  time.Time       `json:"updated_at"`
+	ID               string          `json:"id"`
+	UserID           string          `json:"user_id"`
+	FileName         string          `json:"file_name"`
+	MimeType         string          `json:"mime_type"`
+	Size             int64           `json:"size"`
+	ProcessingStatus string          `json:"processing_status"`
+	Dimensions       *Dimensions     `json:"dimensions,omitempty"` // nil, пока оригинал не обработан
+	Thumbnails       []ThumbnailInfo `json:"thumbnails"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
 }
 
 // ErrorResponse — тело ответа об ошибке.
@@ -96,17 +97,22 @@ func avatarToResponse(a *domain.Avatar) AvatarResponse {
 
 // avatarToMetadata преобразует доменную модель в ответ метаданных.
 func avatarToMetadata(a *domain.Avatar) MetadataResponse {
+	var dims *Dimensions
+	if a.Width != nil && a.Height != nil {
+		dims = &Dimensions{Width: *a.Width, Height: *a.Height}
+	}
+
 	return MetadataResponse{
-		ID:       a.ID.String(),
-		UserID:   a.UserID,
-		FileName: a.FileName,
-		MimeType: a.MimeType,
-		Size:     a.SizeBytes,
-		// Реальные размеры появятся на ШАГЕ 7 (после ресайза).
-		Dimensions: Dimensions{},
-		Thumbnails: buildThumbnails(a.ThumbnailS3Keys),
-		CreatedAt:  a.CreatedAt,
-		UpdatedAt:  a.UpdatedAt,
+		ID:               a.ID.String(),
+		UserID:           a.UserID,
+		FileName:         a.FileName,
+		MimeType:         a.MimeType,
+		Size:             a.SizeBytes,
+		ProcessingStatus: string(a.ProcessingStatus),
+		Dimensions:       dims, // nil → поле отсутствует в JSON
+		Thumbnails:       buildThumbnails(a.ThumbnailS3Keys),
+		CreatedAt:        a.CreatedAt,
+		UpdatedAt:        a.UpdatedAt,
 	}
 }
 

@@ -161,7 +161,7 @@ func startSilo(ctx context.Context) (testcontainers.Container, string, error) {
 	return container, fmt.Sprintf("%s:%s", host, port.Port()), nil
 }
 
-// migrationSQL — схема таблицы avatars (копия migrations/0001_init.sql без goose).
+// migrationSQL — схема таблицы avatars (копия migrations/0001 + 0002 без goose).
 const migrationSQL = `
 CREATE TABLE IF NOT EXISTS avatars (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -173,6 +173,8 @@ CREATE TABLE IF NOT EXISTS avatars (
     thumbnail_s3_keys  JSONB,
     upload_status      VARCHAR(50)  NOT NULL DEFAULT 'uploading',
     processing_status  VARCHAR(50)  NOT NULL DEFAULT 'pending',
+    width              INTEGER,
+    height             INTEGER,
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     deleted_at         TIMESTAMPTZ
@@ -266,6 +268,41 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// httpResult — результат запроса к приложению: статус, заголовки и тело.
+//
+// Тело читается и закрывается внутри do, поэтому наружу отдаётся срез байт, а
+// не *http.Response: тестам не нужно помнить о закрытии, а линтер bodyclose не
+// сообщает об «утечке» там, где её нет.
+type httpResult struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// do выполняет запрос, полностью вычитывает и закрывает тело.
+func (e *env) do(t *testing.T, req *http.Request) httpResult {
+	t.Helper()
+
+	resp, err := e.client.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	return httpResult{status: resp.StatusCode, header: resp.Header, body: body}
+}
+
+// newRequest собирает GET-запрос к приложению с заголовком X-User-ID.
+func (e *env) newRequest(t *testing.T, path string) *http.Request {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, e.baseURL+path, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-User-ID", userID)
+	return req
+}
+
 // upload загружает оригинал через POST /api/v1/avatars и возвращает его ID.
 func (e *env) upload(t *testing.T, data []byte) string {
 	t.Helper()
@@ -278,19 +315,16 @@ func (e *env) upload(t *testing.T, data []byte) string {
 	require.NoError(t, err)
 	require.NoError(t, mw.Close())
 
-	req, err := http.NewRequest(http.MethodPost, e.baseURL+"/api/v1/avatars", &buf)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, e.baseURL+"/api/v1/avatars", &buf)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("X-User-ID", userID)
 
-	resp, err := e.client.Do(req)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	res := e.do(t, req)
+	require.Equal(t, http.StatusCreated, res.status)
 
 	var out handlers.UploadResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.NoError(t, json.Unmarshal(res.body, &out))
 	require.NotEmpty(t, out.ID)
 	return out.ID
 }
@@ -315,27 +349,79 @@ func (e *env) process(t *testing.T, avatarID string) {
 	}))
 }
 
-// getContent запрашивает содержимое аватарки и возвращает ответ и его тело.
-func (e *env) getContent(t *testing.T, avatarID, size string) (*http.Response, []byte) {
+// getContent запрашивает содержимое аватарки: оригинал (size == "") или миниатюру.
+func (e *env) getContent(t *testing.T, avatarID, size string) httpResult {
 	t.Helper()
 
-	target := e.baseURL + "/api/v1/avatars/" + avatarID + "/content"
+	path := "/api/v1/avatars/" + avatarID + "/content"
 	if size != "" {
-		target += "?size=" + url.QueryEscape(size)
+		path += "?size=" + url.QueryEscape(size)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, target, nil)
-	require.NoError(t, err)
-	req.Header.Set("X-User-ID", userID)
+	return e.do(t, e.newRequest(t, path))
+}
 
-	resp, err := e.client.Do(req)
-	require.NoError(t, err)
+// getMetadata запрашивает метаданные аватарки.
+func (e *env) getMetadata(t *testing.T, avatarID string) httpResult {
+	t.Helper()
 
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	_ = resp.Body.Close()
+	return e.do(t, e.newRequest(t, "/api/v1/avatars/"+avatarID+"/metadata"))
+}
 
-	return resp, body
+// processAsync запускает обработку в отдельной горутине — так же, как это делает
+// воркер в проде. Нужен, чтобы тест ждал результат опросом, а не вызывал
+// обработку синхронно.
+func (e *env) processAsync(t *testing.T, avatarID string) {
+	t.Helper()
+
+	go func() {
+		ctx := context.Background()
+
+		id, err := uuid.Parse(avatarID)
+		if err != nil {
+			return
+		}
+		avatar, err := e.repo.GetByID(ctx, id)
+		if err != nil {
+			return
+		}
+
+		h := worker.NewHandler(e.repo, e.storage, worker.ResizerFunc(resizer.ResizeBatch), testLogger())
+		_ = h.HandleUpload(ctx, publisher.AvatarUploadEvent{
+			AvatarID: avatarID,
+			UserID:   avatar.UserID,
+			S3Key:    avatar.S3Key,
+		})
+	}()
+}
+
+// waitForCompleted ждёт, пока метаданные покажут processing_status=completed и
+// непустые размеры (polling по HTTP, суммарный таймаут timeout).
+//
+// Опрос идёт через публичный эндпоинт, а не напрямую в БД: так проверяется вся
+// цепочка — воркер записал в БД, хендлер отдал, DTO сериализовал.
+func (e *env) waitForCompleted(t *testing.T, avatarID string, timeout time.Duration) handlers.MetadataResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var last handlers.MetadataResponse
+
+	for time.Now().Before(deadline) {
+		res := e.getMetadata(t, avatarID)
+		if res.status == http.StatusOK {
+			var meta handlers.MetadataResponse
+			if err := json.Unmarshal(res.body, &meta); err == nil {
+				last = meta
+				if meta.ProcessingStatus == string(domain.ProcessingStatusCompleted) && meta.Dimensions != nil {
+					return meta
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("метаданные не дошли до completed с размерами за %s (последний ответ: %+v)", timeout, last)
+	return last
 }
 
 // testJPEG генерирует JPEG заданного размера с узором из точек.
@@ -368,22 +454,50 @@ func TestE2E_GetContent_ReturnsBytes(t *testing.T) {
 	e.process(t, avatarID)
 
 	// Миниатюра: пропорции 640x480 → 100x75, формат всегда JPEG.
-	resp, body := e.getContent(t, avatarID, "100x100")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "image/jpeg", resp.Header.Get("Content-Type"))
-	assert.Equal(t, fmt.Sprintf("%d", len(body)), resp.Header.Get("Content-Length"))
-	assert.Equal(t, "public, max-age=86400", resp.Header.Get("Cache-Control"))
-	assert.NotEmpty(t, resp.Header.Get("ETag"))
+	res := e.getContent(t, avatarID, "100x100")
+	require.Equal(t, http.StatusOK, res.status)
+	assert.Equal(t, "image/jpeg", res.header.Get("Content-Type"))
+	assert.Equal(t, fmt.Sprintf("%d", len(res.body)), res.header.Get("Content-Length"))
+	assert.Equal(t, "public, max-age=86400", res.header.Get("Cache-Control"))
+	assert.NotEmpty(t, res.header.Get("ETag"))
 
-	decoded, err := imaging.Decode(bytes.NewReader(body))
+	decoded, err := imaging.Decode(bytes.NewReader(res.body))
 	require.NoError(t, err, "тело ответа должно быть валидным JPEG")
 	assert.Equal(t, 100, decoded.Bounds().Dx())
 	assert.Equal(t, 75, decoded.Bounds().Dy())
 
 	// Оригинал: байты совпадают с загруженными.
-	resp, body = e.getContent(t, avatarID, "original")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, original, body)
+	res = e.getContent(t, avatarID, "original")
+	require.Equal(t, http.StatusOK, res.status)
+	assert.Equal(t, original, res.body)
+}
+
+// TestE2E_Metadata_Dimensions проверяет, что размеры оригинала появляются в
+// метаданных после асинхронной обработки (polling), а до неё полей нет.
+func TestE2E_Metadata_Dimensions(t *testing.T) {
+	e := newEnv(t)
+
+	avatarID := e.upload(t, testJPEG(t, 640, 480))
+
+	// До обработки: dimensions отсутствует в JSON (nullable → omitempty),
+	// а processing_status ещё pending.
+	res := e.getMetadata(t, avatarID)
+	require.Equal(t, http.StatusOK, res.status)
+	assert.NotContains(t, string(res.body), "dimensions")
+
+	var pending handlers.MetadataResponse
+	require.NoError(t, json.Unmarshal(res.body, &pending))
+	assert.Nil(t, pending.Dimensions)
+	assert.Equal(t, "pending", pending.ProcessingStatus)
+
+	// Асинхронная обработка → ждём completed и размеры (timeout 10s).
+	e.processAsync(t, avatarID)
+	meta := e.waitForCompleted(t, avatarID, 10*time.Second)
+
+	assert.Equal(t, "completed", meta.ProcessingStatus)
+	require.NotNil(t, meta.Dimensions)
+	assert.Equal(t, 640, meta.Dimensions.Width)
+	assert.Equal(t, 480, meta.Dimensions.Height)
 }
 
 // TestE2E_GetContent_UnknownSize проверяет 501 и подсказку по доступным размерам.
@@ -392,9 +506,9 @@ func TestE2E_GetContent_UnknownSize(t *testing.T) {
 
 	avatarID := e.upload(t, testJPEG(t, 200, 200))
 
-	resp, body := e.getContent(t, avatarID, "500x500")
-	require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+	res := e.getContent(t, avatarID, "500x500")
+	require.Equal(t, http.StatusNotImplemented, res.status)
 	assert.JSONEq(t,
 		`{"error":"Not Implemented","details":"available sizes: original, 100x100, 300x300"}`,
-		string(body))
+		string(res.body))
 }

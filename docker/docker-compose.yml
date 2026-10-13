@@ -211,11 +211,10 @@ services:
       S3_USE_SSL: "false"
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RABBITMQ_EXCHANGE: avatars.exchange
-      # Зарезервировано: config.Load() пока НЕ читает эту переменную, TTL
-      # берётся из publisher.DefaultRetryTTL. Значения совпадают (30s),
-      # поэтому поведение то же. Чтобы переменная заработала, нужна правка
-      # internal/config (вне рамок этого шага).
-      RABBITMQ_RETRY_TTL: 30000
+      # Go-формат duration ("30s"), а не миллисекунды: config.Load() парсит
+      # значение через time.ParseDuration, и «30000» приводит к падению старта
+      # с ошибкой "must be a valid duration".
+      RABBITMQ_RETRY_TTL: 30s
     networks:
       - gophprofile
 

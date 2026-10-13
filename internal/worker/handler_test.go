@@ -187,7 +187,7 @@ func startSilo(ctx context.Context) (testcontainers.Container, string, error) {
 	return container, fmt.Sprintf("%s:%s", host, port.Port()), nil
 }
 
-// migrationSQL — схема таблицы avatars (копия migrations/0001_init.sql без goose).
+// migrationSQL — схема таблицы avatars (копия migrations/0001 + 0002 без goose).
 const migrationSQL = `
 CREATE TABLE IF NOT EXISTS avatars (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS avatars (
     thumbnail_s3_keys  JSONB,
     upload_status      VARCHAR(50)  NOT NULL DEFAULT 'uploading',
     processing_status  VARCHAR(50)  NOT NULL DEFAULT 'pending',
+    width              INTEGER,
+    height             INTEGER,
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     deleted_at         TIMESTAMPTZ
@@ -300,6 +302,8 @@ func makeJPEG(t *testing.T, w, h int) []byte {
 }
 
 // newPendingAvatar создаёт в БД запись со статусом pending и уникальным ключом.
+//
+//nolint:revive // context-as-argument: в тестовых хелперах первым идёт *testing.T
 func newPendingAvatar(t *testing.T, env *testEnv, ctx context.Context) *domain.Avatar {
 	t.Helper()
 
@@ -324,6 +328,8 @@ func newPendingAvatar(t *testing.T, env *testEnv, ctx context.Context) *domain.A
 }
 
 // uploadOriginal кладёт оригинал в S3 по ключу аватара.
+//
+//nolint:revive // context-as-argument: в тестовых хелперах первым идёт *testing.T
 func uploadOriginal(t *testing.T, env *testEnv, ctx context.Context, a *domain.Avatar, data []byte) {
 	t.Helper()
 	require.NoError(t, env.storage.Upload(ctx, a.S3Key, bytes.NewReader(data), int64(len(data)), "image/jpeg"))
@@ -354,6 +360,12 @@ func TestHandler_HandleUpload_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.ProcessingStatusCompleted, got.ProcessingStatus)
 	require.Len(t, got.ThumbnailS3Keys, len(resizer.DefaultSizes))
+
+	// Размеры оригинала сохранены (заполняются через CompleteProcessing).
+	require.NotNil(t, got.Width, "width не заполнен")
+	require.NotNil(t, got.Height, "height не заполнен")
+	assert.Equal(t, 500, *got.Width)
+	assert.Equal(t, 500, *got.Height)
 
 	for size, key := range got.ThumbnailS3Keys {
 		rc, _, err := env.storage.Download(ctx, key)
@@ -449,6 +461,28 @@ func TestHandler_HandleUpload_ResizeFails(t *testing.T) {
 	got, err := env.repo.GetByID(ctx, a.ID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.ProcessingStatusPending, got.ProcessingStatus)
+}
+
+func TestHandler_HandleUpload_InvalidImage(t *testing.T) {
+	env, ctx := setupTest(t)
+	a := newPendingAvatar(t, env, ctx)
+
+	// В S3 лежит не изображение: GetDimensions должен упасть до ресайза.
+	uploadOriginal(t, env, ctx, a, []byte("definitely not an image"))
+
+	// Ресайзер настоящий: ошибка обязана возникнуть на шаге размеров, а не ресайза.
+	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), nil)
+
+	err := h.HandleUpload(ctx, uploadEvent(a))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "worker: get dimensions")
+
+	// Статус не переведён в completed — событие можно повторить.
+	got, err := env.repo.GetByID(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.ProcessingStatusPending, got.ProcessingStatus)
+	assert.Nil(t, got.Width)
+	assert.Nil(t, got.Height)
 }
 
 // ─── HandleDelete ───────────────────────────────────────────────────────────

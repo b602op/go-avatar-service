@@ -55,7 +55,7 @@ func (r *AvatarRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.A
 	const q = `
 		SELECT id, user_id, file_name, mime_type, size_bytes, s3_key,
 		       thumbnail_s3_keys, upload_status, processing_status,
-		       created_at, updated_at, deleted_at
+		       created_at, updated_at, deleted_at, width, height
 		FROM avatars
 		WHERE id = $1 AND deleted_at IS NULL
 	`
@@ -76,7 +76,7 @@ func (r *AvatarRepository) ListByUserID(ctx context.Context, userID string) ([]*
 	const q = `
 		SELECT id, user_id, file_name, mime_type, size_bytes, s3_key,
 		       thumbnail_s3_keys, upload_status, processing_status,
-		       created_at, updated_at, deleted_at
+		       created_at, updated_at, deleted_at, width, height
 		FROM avatars
 		WHERE user_id = $1 AND deleted_at IS NULL
 		ORDER BY created_at DESC
@@ -132,6 +132,39 @@ func (r *AvatarRepository) UpdateProcessingStatus(
 	return nil
 }
 
+// CompleteProcessing фиксирует успешную обработку: статус, миниатюры и размеры
+// оригинала. Возвращает ErrNotFound, если записи нет или она мягко удалена.
+func (r *AvatarRepository) CompleteProcessing(
+	ctx context.Context,
+	id uuid.UUID,
+	thumbnails map[string]string,
+	width, height int,
+) error {
+	thumbJSON, err := marshalThumbnails(thumbnails)
+	if err != nil {
+		return err
+	}
+
+	const q = `
+		UPDATE avatars
+		SET processing_status = 'completed',
+		    thumbnail_s3_keys = $1,
+		    width = $2,
+		    height = $3,
+		    updated_at = NOW()
+		WHERE id = $4 AND deleted_at IS NULL
+	`
+
+	tag, err := r.pool.Exec(ctx, q, thumbJSON, width, height, id)
+	if err != nil {
+		return fmt.Errorf("postgres: complete processing: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 // UpdateUploadStatus обновляет upload_status.
 func (r *AvatarRepository) UpdateUploadStatus(ctx context.Context, id uuid.UUID, status domain.UploadStatus) error {
 	const q = `
@@ -175,7 +208,7 @@ func (r *AvatarRepository) ListPending(ctx context.Context, olderThan time.Durat
 	const q = `
 		SELECT id, user_id, file_name, mime_type, size_bytes, s3_key,
 		       thumbnail_s3_keys, upload_status, processing_status,
-		       created_at, updated_at, deleted_at
+		       created_at, updated_at, deleted_at, width, height
 		FROM avatars
 		WHERE processing_status = 'pending'
 		  AND deleted_at IS NULL
@@ -224,6 +257,7 @@ func scanAvatar(s rowScanner) (*domain.Avatar, error) {
 		&a.ID, &a.UserID, &a.FileName, &a.MimeType, &a.SizeBytes, &a.S3Key,
 		&thumbRaw, &uploadSt, &processSt,
 		&a.CreatedAt, &a.UpdatedAt, &deletedAt,
+		&a.Width, &a.Height,
 	)
 	if err != nil {
 		return nil, err

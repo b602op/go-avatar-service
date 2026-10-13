@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -158,6 +159,15 @@ func DeclareTopology(ch *amqp.Channel, exchange string, retryTTL time.Duration) 
 		return fmt.Errorf("publisher: declare retry exchange %q: %w", RetryExchange, err)
 	}
 
+	// x-message-ttl в AMQP — int32 (миллисекунды), а time.Duration — int64.
+	// TTL приходит из конфига; ограничиваем сверху, чтобы конвертация не
+	// переполнилась на заведомо ошибочном значении (больше ~24 суток).
+	ttlMillis := retryTTL.Milliseconds()
+	if ttlMillis > math.MaxInt32 {
+		ttlMillis = math.MaxInt32
+	}
+	ttlArg := int32(ttlMillis) //nolint:gosec // G115: значение ограничено MaxInt32 строкой выше
+
 	retryQueues := []struct {
 		queue    string
 		retryKey string
@@ -168,7 +178,7 @@ func DeclareTopology(ch *amqp.Channel, exchange string, retryTTL time.Duration) 
 	}
 	for _, r := range retryQueues {
 		args := amqp.Table{
-			"x-message-ttl":             int32(retryTTL / time.Millisecond),
+			"x-message-ttl":             ttlArg,
 			"x-dead-letter-exchange":    exchange,
 			"x-dead-letter-routing-key": r.mainKey,
 		}

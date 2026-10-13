@@ -44,7 +44,16 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	// был доступен логгеру; Recoverer — внутри логгера, чтобы паника попала в лог
 	// как 500. CORS — последним: он ставит заголовки до ухода в хендлер.
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	// RealIP подменяет r.RemoteAddr значением из X-Forwarded-For / X-Real-IP.
+	// В chi v5 он помечен deprecated (GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp,
+	// GHSA-9g5q-2w5x-hmxf): без списка доверенных прокси эти заголовки можно
+	// подделать, и в лог попадёт чужой IP.
+	//
+	// Оставляем осознанно: сервис работает за прокси, а RemoteAddr используется
+	// только для логирования (не для авторизации или лимитов). Корректное
+	// решение — доверять заголовкам лишь от известных прокси-адресов — требует
+	// отдельной настройки и вынесено в техдолг шага 11.1.
+	r.Use(middleware.RealIP) //nolint:staticcheck // SA1019: см. комментарий выше
 	r.Use(RequestLogger(log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
