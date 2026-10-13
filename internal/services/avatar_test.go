@@ -1,9 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -13,6 +15,12 @@ import (
 
 	"github.com/b602op/avatars-service/internal/domain"
 )
+
+// newBufferLogger возвращает логгер, пишущий в buf: тесты проверяют, что сбой
+// не остался незамеченным, а попал в лог на нужном уровне.
+func newBufferLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, nil))
+}
 
 func TestAvatarService_Upload_Success(t *testing.T) {
 	repo := &stubAvatarRepo{}
@@ -83,6 +91,96 @@ func TestAvatarService_Upload_StorageFails(t *testing.T) {
 	// При сбое S3 запись в БД не создаётся и событие не публикуется.
 	assert.Nil(t, repo.created)
 	assert.Zero(t, pub.uploadedCount)
+}
+
+func TestAvatarService_Upload_PublishFails(t *testing.T) {
+	pubErr := errors.New("rabbitmq unavailable")
+	repo := &stubAvatarRepo{}
+	storage := &stubObjectStorage{}
+	pub := &stubEventPublisher{
+		uploadedFn: func(context.Context, uuid.UUID, string, string) error {
+			return pubErr
+		},
+	}
+	var logs bytes.Buffer
+	svc := NewAvatarService(repo, storage, pub, newBufferLogger(&logs))
+
+	// Публикация — best-effort: загрузка считается успешной.
+	got, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Запись создана со статусом pending — cleanup-воркер её подберёт.
+	require.NotNil(t, repo.created)
+	assert.Equal(t, domain.ProcessingStatusPending, repo.created.ProcessingStatus)
+
+	// Паблишер был вызван, оригинал в S3 остался (компенсации нет).
+	assert.Equal(t, 1, pub.uploadedCount)
+	assert.NotEmpty(t, storage.uploadedKey)
+
+	// Сбой залогирован на уровне WARN.
+	assert.Contains(t, logs.String(), "upload event was not published")
+	assert.Contains(t, logs.String(), "WARN")
+}
+
+func TestAvatarService_Upload_RepoCreateFails(t *testing.T) {
+	repoErr := errors.New("db unavailable")
+	repo := &stubAvatarRepo{
+		createFn: func(context.Context, *domain.Avatar) error {
+			return repoErr
+		},
+	}
+
+	// Запоминаем ключ, который сервис попытается удалить.
+	var deletedKey string
+	storage := &stubObjectStorage{
+		deleteFn: func(_ context.Context, key string) error {
+			deletedKey = key
+			return nil
+		},
+	}
+	pub := &stubEventPublisher{}
+	svc := NewAvatarService(repo, storage, pub, nil)
+
+	_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, repoErr)
+
+	// Компенсация: orphan удалён по тому же ключу, что загружали.
+	assert.Equal(t, storage.uploadedKey, deletedKey)
+	assert.NotEmpty(t, deletedKey)
+
+	// Событие не публикуется: записи в БД нет.
+	assert.Zero(t, pub.uploadedCount)
+}
+
+func TestAvatarService_Upload_RepoCreateFails_CompensationFails(t *testing.T) {
+	repoErr := errors.New("db unavailable")
+	delErr := errors.New("s3 unavailable")
+
+	repo := &stubAvatarRepo{
+		createFn: func(context.Context, *domain.Avatar) error {
+			return repoErr
+		},
+	}
+	storage := &stubObjectStorage{
+		deleteFn: func(context.Context, string) error {
+			return delErr
+		},
+	}
+	var logs bytes.Buffer
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, newBufferLogger(&logs))
+
+	_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
+
+	// Клиенту возвращаем исходную ошибку (сбой БД), а не ошибку удаления.
+	require.Error(t, err)
+	assert.ErrorIs(t, err, repoErr)
+	assert.NotErrorIs(t, err, delErr)
+
+	// Осиротевший объект залогирован на уровне ERROR.
+	assert.Contains(t, logs.String(), "orphan in object storage")
+	assert.Contains(t, logs.String(), "ERROR")
 }
 
 func TestAvatarService_GetContent_Original(t *testing.T) {

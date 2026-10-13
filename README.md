@@ -71,6 +71,25 @@ make up
 Под капотом это `docker compose -f docker/docker-compose.yml --env-file .env up -d --build`.
 Сервис будет доступен на `http://localhost:8080`, веб-интерфейс — на `http://localhost:8080/web/upload`.
 
+## Архитектура
+
+```mermaid
+flowchart LR
+    Client[Внешний сервис / SPA] -->|HTTP| Server[server :8080]
+    Server -->|SQL: metadata| PG[(PostgreSQL)]
+    Server -->|"S3 API: upload,<br/>download (content)"| S3[(MinIO / S3)]
+    Server -->|publish events| RMQ([RabbitMQ])
+    RMQ -->|consume events| Worker[worker]
+    Worker -->|S3 API: download original,<br/>upload thumbnails 100×100, 300×300| S3
+    Worker -->|SQL: update processing_status | PG
+    
+    style Server fill:#4A90D9,color:#fff
+    style Worker fill:#7B68EE,color:#fff
+    style PG fill:#336791,color:#fff
+    style S3 fill:#C72C48,color:#fff
+    style RMQ fill:#FF6600,color:#fff
+```
+
 ### Что поднимается
 
 | Сервис | Контейнер | Порты на хосте | Назначение |
@@ -82,11 +101,88 @@ make up
 | `server` | `gophprofile-server` | 8080 | HTTP API |
 | `worker` | `gophprofile-worker` | — | обработка событий (миниатюры, удаление) |
 
+
+### Как это работает
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as server
+    participant PG as PostgreSQL
+    participant S3 as MinIO/S3
+    participant Q as RabbitMQ
+    participant W as worker
+
+    U->>S: POST /api/v1/avatars (multipart, X-User-ID)
+    S->>S: Validate (magic bytes, size ≤ 10MB)
+    S->>S3: Upload original
+    S->>PG: INSERT avatar (uploaded, pending)
+    S->>Q: Publish avatar.uploaded
+    S-->>U: 201 Created {status: "processing"}
+    
+    Note over Q,W: Асинхронно
+    Q->>W: Consume avatar.uploaded
+    W->>S3: Download original
+    W->>W: Resize to 100x100, 300x300
+    W->>S3: Upload thumbnails
+    W->>PG: UPDATE processing_status=completed, thumbnails, dimensions
+    W->>Q: Ack
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as server
+    participant PG as PostgreSQL
+    participant Q as RabbitMQ
+    participant W as worker
+    participant S3 as MinIO/S3
+
+    U->>S: DELETE /api/v1/avatars/{id} (X-User-ID)
+    S->>PG: SELECT avatar (check owner)
+    alt owner mismatch
+        S-->>U: 403 Forbidden
+    else owner ok
+        S->>PG: UPDATE deleted_at = NOW() (soft delete)
+        S->>Q: Publish avatar.deleted (with S3 keys)
+        S-->>U: 204 No Content
+    end
+    
+    Note over Q,W: Асинхронно
+    Q->>W: Consume avatar.deleted
+    W->>S3: RemoveObjects (original + thumbnails)
+    W->>Q: Ack
+```
+
 ### Порядок запуска
 
 `server` и `worker` ждут готовности зависимостей, а не просто их старта:
 `postgres`, `minio` и `rabbitmq` должны пройти healthcheck, а `migrate` —
 успешно завершиться. Поэтому схема БД гарантированно создана до первого запроса.
+
+### Retry / DLQ
+
+```mermaid
+flowchart TD
+    Handler[worker.Handler] -->|error| Type{Тип ошибки}
+    Type -->|PermanentError<br/>JSON/UUID parse| DLQ[DLQ]
+    Type -->|Transient<br/>retry &lt; 3| RetryQ[Retry Queue<br/>TTL 30s]
+    Type -->|Transient<br/>retry ≥ 3| DLQ
+    RetryQ -->|TTL expired| MainQueue[Main Queue]
+    MainQueue --> Handler
+    DLQ -.->|manual inspection| Ops[Ops]
+    
+    style DLQ fill:#C72C48,color:#fff
+    style RetryQ fill:#FFA500,color:#fff
+    style MainQueue fill:#4A90D9,color:#fff
+```
+
+### Логика:
+
+1) PermanentError (невалидное сообщение) → сразу DLQ.
+2) Transient-ошибка → retry-очередь с TTL 30s → возвращается в main → снова handler.
+3) После 3 попыток → DLQ.
+4) x-death.count инкрементится при каждом dead-lettering (retry → main).
 
 ### Полезные команды
 

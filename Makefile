@@ -1,60 +1,143 @@
-.PHONY: help up up-infra down down-v restart logs logs-server logs-worker ps \
-        build build-images migrate test lint run-server run-worker
+.DEFAULT_GOAL := help
 
-COMPOSE = docker compose -f docker/docker-compose.yml --env-file .env
+SHELL := /bin/sh
+
+COMPOSE := docker compose -f docker/docker-compose.yml --env-file .env
+GO := go
+
+.PHONY: help check-env check-docker up up-no-wait up-infra down down-v restart \
+        rebuild-app logs logs-server logs-worker logs-infra ps config \
+        build build-binaries build-images migrate migrate-down \
+        test test-v test-cover test-race lint vet fmt fmt-check clean clean-all \
+        run-server run-worker deps
+
+# ─── Help ────────────────────────────────────────────────────────────────────
 
 help: ## Показать список команд
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-up: ## Поднять весь стек (инфраструктура + server + worker), пересобрать образы
+# ─── Checks ──────────────────────────────────────────────────────────────────
+
+check-env: ## Проверить наличие .env
+	@if [ ! -f .env ]; then \
+		echo "Ошибка: файл .env не найден."; \
+		echo "Создай его командой: cp .env.example .env"; \
+		exit 1; \
+	fi
+
+check-docker: check-env ## Проверить Docker и конфигурацию Compose
+	@command -v docker >/dev/null 2>&1 || { \
+		echo "Ошибка: Docker не найден."; exit 1; \
+	}
+	@docker compose version >/dev/null
+	@test -f docker/docker-compose.yml || { \
+		echo "Ошибка: docker/docker-compose.yml не найден."; exit 1; \
+	}
+	@$(COMPOSE) config -q
+
+# ─── Docker Compose ──────────────────────────────────────────────────────────
+
+up: check-docker ## Запустить весь стек и дождаться healthy
+	$(COMPOSE) up -d --build --wait
+
+up-no-wait: check-docker ## Запустить весь стек без ожидания healthy
 	$(COMPOSE) up -d --build
-	@echo "Waiting for services to be healthy..."
-	@sleep 5
-	$(COMPOSE) ps
 
-up-infra: ## Поднять только инфраструктуру (postgres, minio, rabbitmq)
-	$(COMPOSE) up -d postgres minio rabbitmq
-	@echo "Waiting for services to be healthy..."
-	@sleep 5
-	$(COMPOSE) ps
+up-infra: check-docker ## Запустить только инфраструктуру (postgres, minio, rabbitmq)
+	$(COMPOSE) up -d --wait --wait-timeout 120 postgres minio rabbitmq
 
-build-images: ## Собрать образы server и worker (без запуска)
-	$(COMPOSE) build server worker
-
-migrate: ## Применить миграции к БД (одноразовый контейнер)
-	$(COMPOSE) run --rm migrate
-
-down: ## Остановить стек (данные сохраняются)
+down: check-docker ## Остановить контейнеры, сохранив данные
 	$(COMPOSE) down
 
-down-v: ## Остановить + удалить volumes (ПОЛНАЯ ОЧИСТКА)
+down-v: check-docker ## Остановить и удалить volumes (ОСТОРОЖНО)
 	$(COMPOSE) down -v
 
-restart: down up ## Перезапустить
+restart: check-docker ## Перезапустить весь стек
+	$(COMPOSE) restart
 
-logs: ## Логи всех сервисов
-	$(COMPOSE) logs -f
+rebuild-app: check-docker ## Пересобрать и перезапустить только server и worker
+	$(COMPOSE) up -d --build --wait server worker
 
-logs-server: ## Логи server
-	$(COMPOSE) logs -f server
+build-images: check-docker ## Собрать Docker-образы server и worker
+	$(COMPOSE) build server worker
 
-logs-worker: ## Логи worker
-	$(COMPOSE) logs -f worker
+migrate: check-docker ## Применить миграции (через docker compose)
+	$(COMPOSE) run --rm migrate
 
-ps: ## Статус контейнеров
+ps: check-docker ## Статус контейнеров
 	$(COMPOSE) ps
 
-test: ## Запустить все тесты
-	go test ./... -v
+config: check-docker ## Проверить и вывести конфигурацию Compose
+	$(COMPOSE) config
 
-build: ## Собрать все бинари
-	go build ./...
+# ─── Logs ────────────────────────────────────────────────────────────────────
+
+logs: check-docker ## Логи всех сервисов
+	$(COMPOSE) logs -f
+
+logs-server: check-docker ## Логи HTTP-сервера
+	$(COMPOSE) logs -f server
+
+logs-worker: check-docker ## Логи воркера
+	$(COMPOSE) logs -f worker
+
+logs-infra: check-docker ## Логи инфраструктуры
+	$(COMPOSE) logs -f postgres minio rabbitmq
+
+# ─── Go ──────────────────────────────────────────────────────────────────────
+
+deps: ## Скачать зависимости
+	$(GO) mod download
+
+build: ## Проверить сборку всех пакетов
+	$(GO) build ./...
+
+build-binaries: ## Собрать бинарники в bin/
+	mkdir -p bin
+	$(GO) build -o bin/server ./cmd/server
+	$(GO) build -o bin/worker ./cmd/worker
+
+# ─── Tests & Quality ─────────────────────────────────────────────────────────
+
+test: ## Запустить тесты
+	$(GO) test ./... -count=1
+
+test-v: ## Тесты с подробным выводом
+	$(GO) test ./... -count=1 -v
+
+test-cover: ## Покрытие тестами
+	$(GO) test ./... -count=1 -coverprofile=cover.out
+	$(GO) tool cover -func=cover.out | tail -1
+
+test-race: ## Тесты с race detector
+	$(GO) test ./... -count=1 -race
 
 lint: ## Запустить golangci-lint
-	golangci-lint run
+	golangci-lint run ./...
 
-run-server: ## Запустить server локально
-	go run ./cmd/server
+vet: ## Запустить go vet
+	$(GO) vet ./...
 
-run-worker: ## Запустить worker локально
-	go run ./cmd/worker
+fmt: ## Отформатировать Go-код
+	gofmt -w $$(find . -type f -name '*.go' -not -path './vendor/*')
+
+fmt-check: ## Проверить форматирование
+	@files=$$(gofmt -l .); \
+	if [ -n "$$files" ]; then \
+		echo "Нужно отформатировать:"; echo "$$files"; exit 1; \
+	fi
+
+clean: ## Удалить бинарники и файлы покрытия
+	rm -rf bin/
+	rm -f cover.out cover.html
+	$(GO) clean -testcache
+
+clean-all: down-v clean ## Полная очистка (контейнеры + volumes + файлы)
+
+# ─── Local run ───────────────────────────────────────────────────────────────
+
+run-server: ## Запустить server локально (нужен make up-infra)
+	$(GO) run ./cmd/server
+
+run-worker: ## Запустить worker локально (нужен make up-infra)
+	$(GO) run ./cmd/worker

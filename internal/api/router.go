@@ -70,6 +70,12 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	}
 	r.Get("/health", health)
 
+	// Корень отдаёт форму загрузки: без этого открытие http://host:8080/
+	// чтобы у страницы оставался один канонический адрес /web/upload.
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/web/upload", http.StatusFound)
+	})
+
 	// Веб-интерфейс.
 	r.Get("/web/upload", handlers.ServeUploadForm)
 	r.Get("/web/gallery/{user_id}", handlers.RedirectToGallery)
@@ -81,17 +87,21 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	// r.Route со "/"), чтобы POST /api/v1/avatars работал без завершающего слэша —
 	// именно так его вызывает фронтенд (web/static/index.html).
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(UserID())
-
-		r.Post("/avatars", deps.AvatarHandler.Upload)
+		// ─── GET-эндпоинты (публичные, без X-User-ID) ───
 		r.Get("/avatars/{avatar_id}", deps.AvatarHandler.GetByID)
 		r.Get("/avatars/{avatar_id}/content", deps.AvatarHandler.GetContent)
 		r.Get("/avatars/{avatar_id}/metadata", deps.AvatarHandler.Metadata)
-		r.Delete("/avatars/{avatar_id}", deps.AvatarHandler.Delete)
-
 		r.Get("/users/{user_id}/avatar", deps.AvatarHandler.GetUserAvatar)
-		r.Delete("/users/{user_id}/avatar", deps.AvatarHandler.DeleteUserAvatar)
 		r.Get("/users/{user_id}/avatars", deps.AvatarHandler.ListByUser)
+
+		// ─── Мутации (POST, DELETE) — требуют X-User-ID ───
+		r.Group(func(r chi.Router) {
+			r.Use(UserID())
+
+			r.Post("/avatars", deps.AvatarHandler.Upload)
+			r.Delete("/avatars/{avatar_id}", deps.AvatarHandler.Delete)
+			r.Delete("/users/{user_id}/avatar", deps.AvatarHandler.DeleteUserAvatar)
+		})
 	})
 
 	return r

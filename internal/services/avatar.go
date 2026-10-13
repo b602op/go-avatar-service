@@ -56,7 +56,14 @@ func NewAvatarService(
 // Upload валидирует изображение, сохраняет оригинал в S3 и создаёт запись в БД.
 //
 // Порядок шагов: ValidateImage → генерация ID и ключа → storage.Upload →
-// repo.Create → публикация события. Ошибки не логируются, а возвращаются наверх.
+// repo.Create → публикация события.
+//
+// Публикация события — best-effort: запись уже создана со статусом pending,
+// поэтому сбой брокера не отменяет загрузку. Зависшую запись подберёт
+// cleanup-воркер (outbox-lite) и переопубликует событие.
+//
+// Ошибка repo.Create компенсируется удалением уже загруженного оригинала,
+// иначе файл остался бы в S3 навсегда (orphan).
 func (s *AvatarService) Upload(
 	ctx context.Context,
 	userID, fileName, contentType string,
@@ -95,11 +102,27 @@ func (s *AvatarService) Upload(
 	}
 
 	if err := s.repo.Create(ctx, avatar); err != nil {
+		// Компенсация: записи в БД нет, значит оригинал в S3 — orphan.
+		// Удаляем его, чтобы не оставлять мусор. Если удалить не удалось,
+		// файл остаётся навсегда: логируем громко (техдолг — нужен
+		// отдельный sweeper для осиротевших объектов).
+		if delErr := s.storage.Delete(ctx, s3Key); delErr != nil {
+			s.log.Error("upload compensation failed: orphan in object storage",
+				"avatar_id", avatarID,
+				"s3_key", s3Key,
+				"delete_err", delErr,
+			)
+		}
 		return nil, fmt.Errorf("services: create avatar record: %w", err)
 	}
 
 	if err := s.publisher.PublishAvatarUploaded(ctx, avatarID, userID, s3Key); err != nil {
-		return nil, fmt.Errorf("services: publish avatar uploaded: %w", err)
+		// Best-effort: запись создана, клиент получает 201. Событие
+		// переопубликует cleanup-воркер, увидев pending-аватар.
+		s.log.Warn("avatar created but upload event was not published",
+			"avatar_id", avatarID,
+			"err", err,
+		)
 	}
 
 	s.log.Info("avatar uploaded", "avatar_id", avatarID, "user_id", userID)

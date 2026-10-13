@@ -108,6 +108,16 @@ func TestRouter_Health_NilHandler(t *testing.T) {
 	assert.Equal(t, "down", resp.Status)
 }
 
+func TestRouter_RootRedirectsToWebUpload(t *testing.T) {
+	router := NewRouter(RouterDeps{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, "/web/upload", rec.Header().Get("Location"))
+}
+
 func TestRouter_NotFound(t *testing.T) {
 	router := NewRouter(RouterDeps{})
 
@@ -215,15 +225,38 @@ func TestMiddleware_RequestLogger(t *testing.T) {
 	assert.Equal(t, float64(http.StatusInternalServerError), errEntry["status"])
 }
 
-func TestRouter_APIRequiresUserID(t *testing.T) {
+func TestRouter_APIRequiresUserID_Post(t *testing.T) {
 	router := newRouterWithHandler()
 
-	// Без заголовка X-User-ID защищённый маршрут отдаёт 400 от middleware.
+	// POST без заголовка X-User-ID → 400 от middleware.
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/avatars/"+uuid.NewString(), nil))
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/avatars", nil))
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.JSONEq(t, `{"error":"invalid X-User-ID"}`, rec.Body.String())
+}
+
+func TestRouter_APIRequiresUserID_Delete(t *testing.T) {
+	router := newRouterWithHandler()
+
+	// DELETE без заголовка X-User-ID → 400 от middleware.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/avatars/"+uuid.NewString(), nil))
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.JSONEq(t, `{"error":"invalid X-User-ID"}`, rec.Body.String())
+}
+
+func TestRouter_APIAllowsGetWithoutUserID(t *testing.T) {
+	router := newRouterWithHandler()
+
+	// GET без заголовка X-User-ID → маршрут публичный, middleware не применяется.
+	// Ожидаем 404 (аватара нет), но точно не 400 (invalid X-User-ID).
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/avatars/"+uuid.NewString(), nil))
+
+	require.NotEqual(t, http.StatusBadRequest, rec.Code, "GET не должен требовать X-User-ID")
+	assert.NotContains(t, rec.Body.String(), "invalid X-User-ID")
 }
 
 func TestRouter_APIAcceptsUserID(t *testing.T) {
