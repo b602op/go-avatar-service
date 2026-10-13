@@ -24,6 +24,9 @@ const staticDir = "web/static"
 type RouterDeps struct {
 	Log           *slog.Logger
 	AvatarHandler *handlers.AvatarHandler
+	// Health — готовый хендлер /health. Собирается в main.go, потому что
+	// проверки требуют pool, storage и broker, недоступных уровню api.
+	Health http.HandlerFunc
 	// AllowedOrigins — список разрешённых Origin для CORS ("*" — все).
 	AllowedOrigins []string
 }
@@ -48,7 +51,15 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	r.Use(CORS(deps.AllowedOrigins))
 
 	// Публичные маршруты (без X-User-ID).
-	r.Get("/health", handlers.Health())
+	//
+	// Если хендлер /health не передан, подставляем настоящий с nil-зависимостями:
+	// он честно ответит «down». Иначе роутер упал бы с nil-паникой на запросе.
+	health := deps.Health
+	if health == nil {
+		log.Warn("health handler is not configured, using degraded stub")
+		health = handlers.Health(nil, nil, nil, log)
+	}
+	r.Get("/health", health)
 
 	// Веб-интерфейс.
 	r.Get("/web/upload", handlers.ServeUploadForm)

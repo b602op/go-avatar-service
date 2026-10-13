@@ -90,9 +90,14 @@ func main() {
 	svc := services.NewAvatarService(repo, storage, pub, log)
 	avatarHandler := handlers.NewAvatarHandler(svc, log)
 
+	// /health проверяет все внешние зависимости; собирается здесь, потому что
+	// уровню api (роутеру) pool, storage и брокер недоступны.
+	healthHandler := handlers.Health(pool, storage, pub.Conn(), log)
+
 	router := api.NewRouter(api.RouterDeps{
 		Log:            log,
 		AvatarHandler:  avatarHandler,
+		Health:         healthHandler,
 		AllowedOrigins: []string{"*"}, // MVP: разрешаем все источники
 	})
 

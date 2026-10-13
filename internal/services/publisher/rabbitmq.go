@@ -204,6 +204,15 @@ func DeclareTopology(ch *amqp.Channel, exchange string, retryTTL time.Duration) 
 	return nil
 }
 
+// Conn возвращает AMQP-соединение паблишера.
+//
+// Нужен для health-check: /health проверяет, что соединение с брокером не
+// закрыто (amqp.Connection.IsClosed). Владение соединением остаётся за
+// паблишером — закрывать его должен только Close.
+func (p *RabbitMQPublisher) Conn() *amqp.Connection {
+	return p.conn
+}
+
 // Close закрывает канал и соединение. Повторный вызов безопасен.
 func (p *RabbitMQPublisher) Close() error {
 	var errs []error

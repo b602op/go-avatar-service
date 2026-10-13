@@ -46,12 +46,22 @@ func (apiStubService) Delete(context.Context, uuid.UUID, string) error {
 	return domain.ErrNotFound
 }
 
+// healthStubHandler — простой /health для тестов маршрутизации: всегда 200.
+func healthStubHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
+}
+
 // newRouterWithHandler собирает роутер с реальным хендлером на стабе сервиса.
 func newRouterWithHandler() *chi.Mux {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewRouter(RouterDeps{
 		Log:            log,
 		AvatarHandler:  handlers.NewAvatarHandler(apiStubService{}, log),
+		Health:         healthStubHandler(),
 		AllowedOrigins: []string{"*"},
 	})
 }
@@ -73,7 +83,7 @@ func newTestRouter() *chi.Mux {
 }
 
 func TestRouter_Health(t *testing.T) {
-	router := NewRouter(RouterDeps{})
+	router := NewRouter(RouterDeps{Health: healthStubHandler()})
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -81,6 +91,21 @@ func TestRouter_Health(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 	assert.JSONEq(t, `{"status":"ok"}`, rec.Body.String())
+}
+
+// TestRouter_Health_NilHandler проверяет, что роутер без переданного хендлера
+// /health не паникует, а честно сообщает о нерабочих зависимостях.
+func TestRouter_Health_NilHandler(t *testing.T) {
+	router := NewRouter(RouterDeps{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+	var resp handlers.HealthResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "down", resp.Status)
 }
 
 func TestRouter_NotFound(t *testing.T) {
