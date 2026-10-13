@@ -1,5 +1,13 @@
-# Docker Compose для локальной инфраструктуры GophProfile.
-# Запуск: docker compose -f docker/docker-compose.yml --env-file .env up -d
+# Docker Compose для GophProfile: инфраструктура + приложение.
+#
+# Запуск всего стека:   make up
+# Только инфраструктура: make up-infra
+# Или напрямую:
+#   docker compose -f docker/docker-compose.yml --env-file .env up -d --build
+#
+# Внутри docker-сети сервисы обращаются друг к другу по именам сервисов
+# (postgres, minio, rabbitmq) и ВНУТРЕННИМ портам (5432, 9000, 5672) —
+# не по тем портам, что опубликованы на хост.
 
 name: gophprofile
 
@@ -60,11 +68,154 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
+      # ВАЖНО: именно check_port_connectivity, а не ping.
+      # 'ping' отвечает успехом, как только поднялся Erlang-узел, но AMQP-листенер
+      # на 5672 открывается на 3-4 секунды позже. С 'ping' контейнер объявлялся
+      # healthy раньше времени, и server/worker стартовали в закрытый порт:
+      # "dial tcp ...:5672: connect: connection refused" → crash-loop до тех пор,
+      # пока RabbitMQ не догонит. check_port_connectivity проверяет сами
+      # листенеры (включая 5672), поэтому healthy означает «порт принимает
+      # соединения».
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
       timeout: 5s
       retries: 10
       start_period: 20s
+    networks:
+      - gophprofile
+
+  # ─── Прогон миграций ───────────────────────────────────────────────────────
+  # Одноразовый сервис: применяет все migrations/*.sql и завершается.
+  # Переиспользует образ postgres (psql уже внутри), ничего не меняя в самом
+  # сервисе postgres. Миграции идемпотентны (CREATE ... IF NOT EXISTS),
+  # поэтому повторный запуск безопасен.
+  migrate:
+    image: postgres:16-alpine
+    container_name: gophprofile-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Пароль передаётся через PGPASSWORD, чтобы не светить его в командной строке.
+      PGPASSWORD: ${POSTGRES_PASSWORD:-avatar}
+    volumes:
+      - ../migrations:/migrations:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for f in /migrations/*.sql; do
+          echo "applying $$f"
+          # ВАЖНО: psql выполняет файл целиком, а goose-аннотации — обычные
+          # SQL-комментарии. Без отсечения секции '-- +goose Down' её DROP TABLE
+          # откатил бы только что применённую миграцию.
+          #
+          # Знак $ в sed-скрипте записан удвоенным: одиночный compose принял бы
+          # за подстановку переменной. Результат пишем в файл, а не в пайп, чтобы
+          # ошибка sed не потерялась (set -e не видит статус не-последней
+          # команды конвейера).
+          sed '/^-- +goose Down/,$$d' "$$f" > /tmp/migration.sql
+          psql -v ON_ERROR_STOP=1 \
+               -h postgres \
+               -U "${POSTGRES_USER:-avatar}" \
+               -d "${POSTGRES_DB:-avatars}" \
+               -f /tmp/migration.sql
+        done
+        echo "migrations applied"
+    networks:
+      - gophprofile
+
+  # ─── HTTP-сервер ───────────────────────────────────────────────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: server
+    container_name: gophprofile-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: info
+      HTTP_PORT: 8080
+      # Внутри docker-сети — имя сервиса и внутренний порт (5432, не хостовый).
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-avatar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avatar}
+      POSTGRES_DB: ${POSTGRES_DB:-avatars}
+      POSTGRES_SSLMODE: disable
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-avatars}
+      S3_REGION: us-east-1
+      S3_USE_SSL: "false"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: avatars.exchange
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Тот же /health, что отдаёт приложение: 503 (degraded/down) считается
+      # неуспехом, поэтому статус контейнера отражает состояние зависимостей.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - gophprofile
+
+  # ─── Воркер обработки событий ──────────────────────────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    container_name: gophprofile-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      server:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: info
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-avatar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avatar}
+      POSTGRES_DB: ${POSTGRES_DB:-avatars}
+      POSTGRES_SSLMODE: disable
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-avatars}
+      S3_REGION: us-east-1
+      S3_USE_SSL: "false"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: avatars.exchange
+      # Зарезервировано: config.Load() пока НЕ читает эту переменную, TTL
+      # берётся из publisher.DefaultRetryTTL. Значения совпадают (30s),
+      # поэтому поведение то же. Чтобы переменная заработала, нужна правка
+      # internal/config (вне рамок этого шага).
+      RABBITMQ_RETRY_TTL: 30000
     networks:
       - gophprofile
 
