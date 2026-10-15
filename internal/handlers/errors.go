@@ -37,15 +37,13 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 
 // respondError — централизованный маппинг доменных ошибок в HTTP-ответы.
 //
-// 4xx логируются на уровне Warn (клиентская ошибка), 5xx — на уровне Error
+// 4xx не логируем, 5xx — на уровне Error
 // (серверная). Детали внутренних ошибок наружу не отдаются.
 func respondError(w http.ResponseWriter, log *slog.Logger, err error) {
 	status, payload := mapError(err)
 
 	if status >= http.StatusInternalServerError {
 		log.Error("request failed", "status", status, "error", err)
-	} else {
-		log.Warn("request failed", "status", status, "error", err)
 	}
 
 	respondJSON(w, status, payload)
