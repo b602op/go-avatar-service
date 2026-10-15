@@ -8,6 +8,10 @@
 # Внутри docker-сети сервисы обращаются друг к другу по именам сервисов
 # (postgres, minio, rabbitmq) и ВНУТРЕННИМ портам (5432, 9000, 5672) —
 # не по тем портам, что опубликованы на хост.
+#
+# Миграции БД применяются самими приложениями (server и worker) при старте —
+# goose как библиотека поверх встроенных в бинарник migrations/*.sql. Отдельного
+# сервиса для миграций нет: приложение физически не может подняться без схемы.
 
 name: gophprofile
 
@@ -84,48 +88,6 @@ services:
     networks:
       - gophprofile
 
-  # ─── Прогон миграций ───────────────────────────────────────────────────────
-  # Одноразовый сервис: применяет все migrations/*.sql и завершается.
-  # Переиспользует образ postgres (psql уже внутри), ничего не меняя в самом
-  # сервисе postgres. Миграции идемпотентны (CREATE ... IF NOT EXISTS),
-  # поэтому повторный запуск безопасен.
-  migrate:
-    image: postgres:16-alpine
-    container_name: gophprofile-migrate
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      # Пароль передаётся через PGPASSWORD, чтобы не светить его в командной строке.
-      PGPASSWORD: ${POSTGRES_PASSWORD:-avatar}
-    volumes:
-      - ../migrations:/migrations:ro
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        for f in /migrations/*.sql; do
-          echo "applying $$f"
-          # ВАЖНО: psql выполняет файл целиком, а goose-аннотации — обычные
-          # SQL-комментарии. Без отсечения секции '-- +goose Down' её DROP TABLE
-          # откатил бы только что применённую миграцию.
-          #
-          # Знак $ в sed-скрипте записан удвоенным: одиночный compose принял бы
-          # за подстановку переменной. Результат пишем в файл, а не в пайп, чтобы
-          # ошибка sed не потерялась (set -e не видит статус не-последней
-          # команды конвейера).
-          sed '/^-- +goose Down/,$$d' "$$f" > /tmp/migration.sql
-          psql -v ON_ERROR_STOP=1 \
-               -h postgres \
-               -U "${POSTGRES_USER:-avatar}" \
-               -d "${POSTGRES_DB:-avatars}" \
-               -f /tmp/migration.sql
-        done
-        echo "migrations applied"
-    networks:
-      - gophprofile
-
   # ─── HTTP-сервер ───────────────────────────────────────────────────────────
   server:
     build:
@@ -141,8 +103,6 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
     environment:
       APP_ENV: local
       LOG_LEVEL: info
@@ -190,8 +150,6 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
       server:
         condition: service_started
     environment:

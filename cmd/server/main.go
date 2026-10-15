@@ -16,6 +16,7 @@ import (
 	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services"
 	"github.com/b602op/avatars-service/internal/services/publisher"
@@ -26,6 +27,10 @@ import (
 const (
 	// initTimeout — время на инициализацию подключений (БД, S3).
 	initTimeout = 15 * time.Second
+	// migrationTimeout — бюджет на применение миграций. Отдельно от initTimeout:
+	// подключение к БД укладывается в секунды, а миграции могут создавать
+	// индексы и выполняться заметно дольше.
+	migrationTimeout = 60 * time.Second
 	// shutdownTimeout — время на корректное завершение HTTP-сервера.
 	shutdownTimeout = 30 * time.Second
 	// idleTimeout — время удержания idle-соединений.
@@ -82,6 +87,17 @@ func run() error {
 	defer pool.Close()
 
 	log.Info("postgres connected")
+
+	// Миграции применяются при старте
+	// повторный запуск и параллельный старт server/worker безопасны.
+	migCtx, cancelMig := context.WithTimeout(signalCtx, migrationTimeout)
+	err = migrator.Up(migCtx, pool, log)
+	cancelMig()
+	if err != nil {
+		return fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	log.Info("migrations applied")
 
 	// S3-хранилище: клиент создаётся всегда, бакет гарантируется идемпотентно.
 	storage, err := s3.New(cfg.S3, log)

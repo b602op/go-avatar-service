@@ -11,6 +11,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services/publisher"
 	"github.com/b602op/avatars-service/internal/services/s3"
@@ -19,8 +20,14 @@ import (
 	"github.com/b602op/avatars-service/pkg/resizer"
 )
 
-// initTimeout — время на инициализацию подключений (БД, S3, RabbitMQ).
-const initTimeout = 15 * time.Second
+const (
+	// initTimeout — время на инициализацию подключений (БД, S3, RabbitMQ).
+	initTimeout = 15 * time.Second
+	// migrationTimeout — бюджет на применение миграций. Отдельно от initTimeout:
+	// подключение к БД укладывается в секунды, а миграции могут создавать
+	// индексы и выполняться заметно дольше.
+	migrationTimeout = 60 * time.Second
+)
 
 func main() {
 	// .env необязателен: если файла нет — работаем с переменными окружения ОС.
@@ -54,6 +61,17 @@ func main() {
 	}
 	defer pool.Close()
 	log.Info("postgres connected")
+
+	// Миграции применяются при старте
+	// повторный запуск и параллельный старт server/worker безопасны.
+	migCtx, cancelMig := context.WithTimeout(ctx, migrationTimeout)
+	err = migrator.Up(migCtx, pool, log)
+	cancelMig()
+	if err != nil {
+		log.Error("failed to apply migrations", "error", err)
+		os.Exit(1)
+	}
+	log.Info("migrations applied")
 
 	storage, err := s3.New(cfg.S3, log)
 	if err != nil {

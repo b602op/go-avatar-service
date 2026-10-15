@@ -20,13 +20,14 @@
 │   ├── config/         # Конфигурация приложения
 │   ├── domain/         # Основные доменные сущности
 │   ├── handlers/       # HTTP-обработчики
+│   ├── migrator/       # Применение миграций при старте (goose)
 │   ├── repository/     # Работа с хранилищем (БД, S3)
 │   ├── services/       # Бизнес-логика
 │   └── worker/         # Логика воркера
 ├── pkg/                # Публичные библиотеки, которые можно использовать в других проектах
 ├── web/                # Веб-интерфейс
 │   └── static/         # Статические файлы (HTML, CSS, JS)
-├── migrations/         # Миграции базы данных
+├── migrations/         # SQL-миграции (goose), встраиваются в бинарник
 ├── docker/             # Docker-файлы и конфигурации
 ├── k8s/                # Манифесты Kubernetes
 ├── tests/              # Интеграционные и e2e тесты
@@ -97,7 +98,6 @@ flowchart LR
 | `postgres` | `gophprofile-postgres` | 5432 | база данных |
 | `minio` | `gophprofile-minio` | 9000, 9001 | S3-хранилище (9001 — консоль) |
 | `rabbitmq` | `gophprofile-rabbitmq` | 5672, 15672 | брокер (15672 — management UI) |
-| `migrate` | `gophprofile-migrate` | — | одноразовый прогон миграций |
 | `server` | `gophprofile-server` | 8080 | HTTP API |
 | `worker` | `gophprofile-worker` | — | обработка событий (миниатюры, удаление) |
 
@@ -157,8 +157,22 @@ sequenceDiagram
 ### Порядок запуска
 
 `server` и `worker` ждут готовности зависимостей, а не просто их старта:
-`postgres`, `minio` и `rabbitmq` должны пройти healthcheck, а `migrate` —
-успешно завершиться. Поэтому схема БД гарантированно создана до первого запроса.
+`postgres`, `minio` и `rabbitmq` должны пройти healthcheck. Схему БД каждый
+сервис создаёт себе сам при старте: `internal/migrator` применяет встроенные
+миграции через goose до того, как приложение начнёт обслуживать запросы.
+Поэтому сервис нельзя поднять без нужных таблиц, а отдельный шаг деплоя для
+миграций не требуется.
+
+### Миграции
+
+SQL-миграции лежат в `migrations/` в формате goose (`-- +goose Up` /
+`-- +goose Down`) и встраиваются в бинарник через `//go:embed`. Применяются
+автоматически при старте `server` и `worker`, применённые версии хранятся в
+таблице `goose_db_version` — повторный прогон ничего не выполняет заново.
+
+Новая миграция — файл `migrations/NNNN_имя.sql` с аннотациями goose; следующий
+запуск приложения применит его сам. Одновременный старт `server` и `worker`
+безопасен: goose берёт session-level advisory lock на время прогона.
 
 ### Retry / DLQ
 
@@ -190,7 +204,6 @@ flowchart TD
 make up            # поднять весь стек (пересобирает образы)
 make up-infra      # только инфраструктура (postgres, minio, rabbitmq)
 make build-images  # собрать образы server и worker без запуска
-make migrate       # применить миграции вручную
 make logs          # логи всех сервисов
 make logs-server   # логи server
 make logs-worker   # логи worker
@@ -222,8 +235,7 @@ runtime-target'а: `server` (с веб-статикой) и `worker`. Бинар
 обычными командами:
 
 ```bash
-make migrate     # создать схему в БД
-make run-server  # go run ./cmd/server
+make run-server  # go run ./cmd/server (миграции применит сам)
 make run-worker  # go run ./cmd/worker (в отдельном терминале)
 ```
 

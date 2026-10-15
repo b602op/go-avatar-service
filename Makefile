@@ -7,7 +7,7 @@ GO := go
 
 .PHONY: help check-env check-docker up up-no-wait up-infra down down-v restart \
         rebuild-app logs logs-server logs-worker logs-infra ps config \
-        build build-binaries build-images migrate migrate-down \
+        build build-binaries build-images \
         test test-v test-cover test-race lint vet fmt fmt-check clean clean-all \
         run-server run-worker deps
 
@@ -60,9 +60,6 @@ rebuild-app: check-docker ## Пересобрать и перезапустит�
 
 build-images: check-docker ## Собрать Docker-образы server и worker
 	$(COMPOSE) build server worker
-
-migrate: check-docker ## Применить миграции (через docker compose)
-	$(COMPOSE) run --rm migrate
 
 ps: check-docker ## Статус контейнеров
 	$(COMPOSE) ps
