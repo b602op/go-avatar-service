@@ -15,6 +15,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// DefaultMetricsAddr — адрес сервера метрик по умолчанию.
+//
+// Порт отдельный от HTTP_PORT: /metrics не должен быть доступен через
+// публичный API. Воркер подставляет свой порт (":9091"), см. cmd/worker.
+const DefaultMetricsAddr = ":9090"
+
 // Config — корневая конфигурация приложения.
 type Config struct {
 	App      AppConfig
@@ -25,6 +31,9 @@ type Config struct {
 
 	// LogLevel — уровень логирования, уже распарсенный в slog.Level.
 	LogLevel slog.Level
+
+	// MetricsAddr — адрес отдельного HTTP-сервера с /metrics.
+	MetricsAddr string
 
 	// Observability: OpenTelemetry (трейсинг через OTLP HTTP → Jaeger).
 	OTelEndpoint       string // OTEL_EXPORTER_OTLP_ENDPOINT, напр. http://localhost:4318
@@ -123,6 +132,7 @@ func Load() (*Config, error) {
 			Env: env,
 		},
 		LogLevel:           logLevel,
+		MetricsAddr:        getEnv("METRICS_ADDR", DefaultMetricsAddr),
 		OTelEndpoint:       getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
 		OTelServiceName:    getEnv("OTEL_SERVICE_NAME", "gophprofile"),
 		OTelServiceVersion: getEnv("OTEL_SERVICE_VERSION", "dev"),
@@ -249,12 +259,14 @@ func (c PostgresConfig) ValidateDSN() error {
 func (c Config) String() string {
 	return fmt.Sprintf(
 		"Config{App={Env:%s}, LogLevel:%s, HTTP={Port:%s ReadTimeout:%s WriteTimeout:%s}, "+
+			"Metrics={Addr:%s}, "+
 			"Postgres={Host:%s Port:%s User:%s Password:%s DB:%s SSLMode:%s}, "+
 			"S3={Endpoint:%s Bucket:%s Region:%s AccessKey:%s SecretKey:%s UseSSL:%t}, "+
 			"RabbitMQ={URL:%s Exchange:%s}, "+
 			"OTel={Endpoint:%s ServiceName:%s ServiceVersion:%s Environment:%s}}",
 		c.App.Env, c.LogLevel,
 		c.HTTP.Port, c.HTTP.ReadTimeout, c.HTTP.WriteTimeout,
+		c.MetricsAddr,
 		c.Postgres.Host, c.Postgres.Port, c.Postgres.User, mask(c.Postgres.Password),
 		c.Postgres.DB, c.Postgres.SSLMode,
 		c.S3.Endpoint, c.S3.Bucket, c.S3.Region, mask(c.S3.AccessKey), mask(c.S3.SecretKey), c.S3.UseSSL,

@@ -37,7 +37,8 @@ COPY --from=builder /app/web ./web
 
 USER app
 
-EXPOSE 8080
+# 8080 — публичный API, 9090 — метрики (METRICS_ADDR).
+EXPOSE 8080 9090
 
 ENTRYPOINT ["./server"]
 
@@ -52,5 +53,8 @@ WORKDIR /app
 COPY --from=builder /out/worker ./worker
 
 USER app
+
+# 9091 — метрики и /health воркера (METRICS_ADDR в compose).
+EXPOSE 9091
 
 ENTRYPOINT ["./worker"]

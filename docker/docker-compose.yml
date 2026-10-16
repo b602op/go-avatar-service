@@ -107,6 +107,9 @@ services:
       APP_ENV: local
       LOG_LEVEL: info
       HTTP_PORT: 8080
+      # Порт метрик сервера. Задан явно, хотя совпадает с дефолтом в коде:
+      # так адрес виден в одном месте — рядом с пробросом портов ниже.
+      METRICS_ADDR: :9090
       # Внутри docker-сети — имя сервиса и внутренний порт (5432, не хостовый).
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -124,6 +127,9 @@ services:
       RABBITMQ_EXCHANGE: avatars.exchange
     ports:
       - "8080:8080"
+      # Порт метрик публикуется только для локальной отладки (curl/Prometheus
+      # на хосте). В проде /metrics остаётся внутренним.
+      - "9090:9090"
     healthcheck:
       # Тот же /health, что отдаёт приложение: 503 (degraded/down) считается
       # неуспехом, поэтому статус контейнера отражает состояние зависимостей.
@@ -155,6 +161,10 @@ services:
     environment:
       APP_ENV: local
       LOG_LEVEL: info
+      # У воркера нет публичного HTTP-сервера, поэтому метрики и /health живут
+      # на отдельном порту. Явно задаём :9091 — дефолт в коде (:9090) занят
+      # сервером, и без этой переменной метрики обоих процессов конфликтовали бы.
+      METRICS_ADDR: :9091
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-avatar}
@@ -173,6 +183,17 @@ services:
       # значение через time.ParseDuration, и «30000» приводит к падению старта
       # с ошибкой "must be a valid duration".
       RABBITMQ_RETRY_TTL: 30s
+    ports:
+      - "9091:9091"
+    healthcheck:
+      # Воркерский /health — это liveness, а не проверка зависимостей: он лишь
+      # подтверждает, что процесс жив и обслуживает вспомогательный HTTP-сервер.
+      # Подключения к БД/S3/RabbitMQ проверяются на старте, при инициализации.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9091/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     networks:
       - gophprofile
 

@@ -5,9 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/b602op/avatars-service/internal/httpx"
+	"github.com/b602op/avatars-service/internal/metrics"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
@@ -17,6 +20,11 @@ const (
 	maxUserIDLen = 255
 )
 
+// unknownRoute — метка path для запросов, которым не досталось шаблона
+// маршрута: 404/405 и всё, что не попало в дерево Chi. Конкретный URL здесь
+// использовать нельзя — кардинальность метки выросла бы вместе с данными.
+const unknownRoute = "unknown"
+
 // userIDPattern — допустимые символы идентификатора: латиница, цифры, _ и -.
 var userIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -25,6 +33,7 @@ var (
 	_ func(http.Handler) http.Handler = RequestLogger(slog.Default())
 	_ func(http.Handler) http.Handler = UserID()
 	_ func(http.Handler) http.Handler = CORS([]string{"*"})
+	_ func(http.Handler) http.Handler = Metrics()
 )
 
 // RequestLogger логирует каждый HTTP-запрос.
@@ -57,6 +66,47 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 			} else {
 				log.Info("http request", attrs...)
 			}
+		})
+	}
+}
+
+// Metrics собирает HTTP-метрики (RED) и отдаёт их в Prometheus.
+//
+// Регистрируется ПОСЛЕ otelhttp и до CORS: Chi выполняет middleware в порядке
+// объявления, а шаблон маршрута появляется только после матчинга, то есть
+// к моменту возврата из next.ServeHTTP. Поэтому chi.RouteContext(...).
+// RoutePattern() внутри Metrics уже заполнен и даёт "/api/v1/avatars/{avatar_id}",
+// а не конкретный URL — кардинальность метки path остаётся на уровне числа
+// маршрутов.
+func Metrics() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+
+			// Тот же wrapper, что и в RequestLogger: в отличие от «голой»
+			// структуры он сохраняет у обёрнутого ResponseWriter интерфейсы
+			// Flusher/Hijacker/io.ReaderFrom, нужные net/http.
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+			next.ServeHTTP(ww, r)
+
+			// Status() == 0, если хендлер не отправил ни заголовков, ни тела:
+			// в этом случае net/http сам отвечает 200, поэтому 0 в метрику
+			// не пишем.
+			status := ww.Status()
+			if status == 0 {
+				status = http.StatusOK
+			}
+
+			path := chi.RouteContext(r.Context()).RoutePattern()
+			if path == "" {
+				path = unknownRoute
+			}
+
+			statusLabel := strconv.Itoa(status)
+			metrics.HTTPRequestsTotal.WithLabelValues(r.Method, path, statusLabel).Inc()
+			metrics.HTTPRequestDuration.WithLabelValues(r.Method, path, statusLabel).
+				Observe(time.Since(start).Seconds())
 		})
 	}
 }

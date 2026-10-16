@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
@@ -28,6 +31,13 @@ const (
 	// подключение к БД укладывается в секунды, а миграции могут создавать
 	// индексы и выполняться заметно дольше.
 	migrationTimeout = 60 * time.Second
+	// shutdownTimeout — время на корректное завершение вспомогательного
+	// HTTP-сервера (метрики и /health).
+	shutdownTimeout = 30 * time.Second
+	// workerMetricsAddr — порт метрик воркера. Отличается от дефолта
+	// config.DefaultMetricsAddr (":9090"), чтобы метрики server и worker можно
+	// было снимать с одного хоста, не путая их.
+	workerMetricsAddr = ":9091"
 )
 
 func main() {
@@ -81,6 +91,38 @@ func main() {
 		// на код возврата и шуметь Error-уровнем при штатной остановке.
 		if shutdownErr := tpShutdown(shutdownCtx); shutdownErr != nil {
 			log.Warn("telemetry shutdown failed", "error", shutdownErr)
+		}
+	}()
+
+	// Метрики: воркер — отдельный процесс со своим реестром Prometheus, поэтому
+	// ему нужен свой порт. Явно заданный METRICS_ADDR приоритетнее дефолта.
+	metricsAddr := cfg.MetricsAddr
+	if metricsAddr == config.DefaultMetricsAddr {
+		metricsAddr = workerMetricsAddr
+	}
+
+	// /health здесь же: у воркера нет собственного HTTP-сервера, а healthcheck
+	// контейнера должен что-то опрашивать. В основной Chi-роутер метрики не
+	// добавляем — они не должны быть доступны через публичный API.
+	metricsSrv := api.NewMetricsServer(metricsAddr, log, true)
+	go func() {
+		log.Info("metrics server listening", "addr", metricsSrv.Addr)
+		if serveErr := metricsSrv.ListenAndServe(); serveErr != nil &&
+			!errors.Is(serveErr, http.ErrServerClosed) {
+			log.Error("metrics server failed", "error", serveErr)
+		}
+	}()
+	// Регистрируется после трейсинга: defer выполняется по LIFO, поэтому
+	// метрики останавливаются раньше, чем досылается батч спанов.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			shutdownTimeout,
+		)
+		defer cancelShutdown()
+
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("failed to shutdown metrics server", "error", err)
 		}
 	}()
 

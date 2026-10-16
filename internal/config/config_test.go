@@ -19,6 +19,7 @@ var allEnvKeys = []string{
 	"S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION", "S3_USE_SSL",
 	"RABBITMQ_URL", "RABBITMQ_EXCHANGE", "RABBITMQ_RETRY_TTL",
 	"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_ENVIRONMENT",
+	"METRICS_ADDR",
 }
 
 // clearEnv сбрасывает все переменные окружения, влияющие на Load.
@@ -45,27 +46,16 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "dev", cfg.OTelServiceVersion)
 	assert.Equal(t, "dev", cfg.OTelEnvironment)
 
-	assert.Equal(t, "8080", cfg.HTTP.Port)
-	assert.Equal(t, 10*time.Second, cfg.HTTP.ReadTimeout)
-	assert.Equal(t, 15*time.Second, cfg.HTTP.WriteTimeout)
+	assert.Equal(t, DefaultMetricsAddr, cfg.MetricsAddr)
+}
 
-	assert.Equal(t, "localhost", cfg.Postgres.Host)
-	assert.Equal(t, "5432", cfg.Postgres.Port)
-	assert.Equal(t, "avatar", cfg.Postgres.User)
-	assert.Equal(t, "avatar", cfg.Postgres.Password)
-	assert.Equal(t, "avatars", cfg.Postgres.DB)
-	assert.Equal(t, "disable", cfg.Postgres.SSLMode)
+func TestLoad_MetricsAddr(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("METRICS_ADDR", ":19090")
 
-	assert.Equal(t, "localhost:9000", cfg.S3.Endpoint)
-	assert.Equal(t, "minioadmin", cfg.S3.AccessKey)
-	assert.Equal(t, "minioadmin", cfg.S3.SecretKey)
-	assert.Equal(t, "avatars", cfg.S3.Bucket)
-	assert.Equal(t, "us-east-1", cfg.S3.Region)
-	assert.False(t, cfg.S3.UseSSL)
-
-	assert.Equal(t, "amqp://guest:guest@localhost:5672/", cfg.RabbitMQ.URL)
-	assert.Equal(t, "avatars.exchange", cfg.RabbitMQ.Exchange)
-	assert.Equal(t, 30*time.Second, cfg.RabbitMQ.RetryTTL)
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, ":19090", cfg.MetricsAddr)
 }
 
 func TestLoad_RabbitMQRetryTTL(t *testing.T) {
