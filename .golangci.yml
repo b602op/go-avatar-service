@@ -1,0 +1,68 @@
+# Конфигурация golangci-lint (синтаксис v1 — для v1.64.x).
+#
+# Запуск: golangci-lint run ./...   (или make lint)
+#
+# Набор линтеров: базовые проверки корректности (govet, staticcheck, unused,
+# ineffassign), обработка ошибок (errcheck, errorlint), работа с ресурсами
+# (bodyclose, rowserrcheck, sqlclosecheck, noctx), безопасность (gosec),
+# стиль (gofmt, goimports, revive, misspell, whitespace) и чистка мёртвого
+# кода (unconvert, unparam).
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - gosec
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - whitespace
+
+linters-settings:
+  govet:
+    # enable-all: true включает проверки, выключенные по умолчанию (в т.ч. shadow).
+    #
+    # shadow дополнительно отключён: он срабатывает на идиоматичном
+    # `if err := f(); err != nil` внутри функции, где `err` уже объявлен выше.
+    # Все 5 таких мест в проекте — штатные guard'ы, реального бага за ними нет,
+    # а «исправление» (err = f() или переименование) ухудшает читаемость.
+    #
+    # fieldalignment исключён: он требует переупорядочивать поля структур ради
+    # выравнивания, что вредит читаемости ради пары байт.
+    enable-all: true
+    disable:
+      - fieldalignment
+      - shadow
+  gosec:
+    excludes:
+      # G404 — использование math/rand. Слабый ГПСЧ допустим: он не применяется
+      # для криптографии (в проекте для этого google/uuid).
+      - G404
+
+issues:
+  exclude-rules:
+    # В тестах необработанные ошибки и «неиспользуемые» параметры стабов —
+    # норма: тесты проверяют поведение, а не педантичность.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - unparam
+  max-issues-per-linter: 0
+  max-same-issues: 0

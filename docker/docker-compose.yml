@@ -1,0 +1,190 @@
+# Docker Compose для GophProfile: инфраструктура + приложение.
+#
+# Запуск всего стека:   make up
+# Только инфраструктура: make up-infra
+# Или напрямую:
+#   docker compose -f docker/docker-compose.yml --env-file .env up -d --build
+#
+# Внутри docker-сети сервисы обращаются друг к другу по именам сервисов
+# (postgres, minio, rabbitmq) и ВНУТРЕННИМ портам (5432, 9000, 5672) —
+# не по тем портам, что опубликованы на хост.
+#
+# Миграции БД применяются самими приложениями (server и worker) при старте —
+# goose как библиотека поверх встроенных в бинарник migrations/*.sql. Отдельного
+# сервиса для миграций нет: приложение физически не может подняться без схемы.
+
+name: gophprofile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gophprofile-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-avatar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avatar}
+      POSTGRES_DB: ${POSTGRES_DB:-avatars}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-avatar} -d ${POSTGRES_DB:-avatars}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - gophprofile
+
+  minio:
+    image: pgsty/silo:latest
+    container_name: gophprofile-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - gophprofile
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: gophprofile-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # ВАЖНО: именно check_port_connectivity, а не ping.
+      # 'ping' отвечает успехом, как только поднялся Erlang-узел, но AMQP-листенер
+      # на 5672 открывается на 3-4 секунды позже. С 'ping' контейнер объявлялся
+      # healthy раньше времени, и server/worker стартовали в закрытый порт:
+      # "dial tcp ...:5672: connect: connection refused" → crash-loop до тех пор,
+      # пока RabbitMQ не догонит. check_port_connectivity проверяет сами
+      # листенеры (включая 5672), поэтому healthy означает «порт принимает
+      # соединения».
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - gophprofile
+
+  # ─── HTTP-сервер ───────────────────────────────────────────────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: server
+    container_name: gophprofile-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: info
+      HTTP_PORT: 8080
+      # Внутри docker-сети — имя сервиса и внутренний порт (5432, не хостовый).
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-avatar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avatar}
+      POSTGRES_DB: ${POSTGRES_DB:-avatars}
+      POSTGRES_SSLMODE: disable
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-avatars}
+      S3_REGION: us-east-1
+      S3_USE_SSL: "false"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: avatars.exchange
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Тот же /health, что отдаёт приложение: 503 (degraded/down) считается
+      # неуспехом, поэтому статус контейнера отражает состояние зависимостей.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - gophprofile
+
+  # ─── Воркер обработки событий ──────────────────────────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    container_name: gophprofile-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      server:
+        condition: service_started
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: info
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-avatar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avatar}
+      POSTGRES_DB: ${POSTGRES_DB:-avatars}
+      POSTGRES_SSLMODE: disable
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-avatars}
+      S3_REGION: us-east-1
+      S3_USE_SSL: "false"
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: avatars.exchange
+      # Go-формат duration ("30s"), а не миллисекунды: config.Load() парсит
+      # значение через time.ParseDuration, и «30000» приводит к падению старта
+      # с ошибкой "must be a valid duration".
+      RABBITMQ_RETRY_TTL: 30s
+    networks:
+      - gophprofile
+
+volumes:
+  pg_data:
+    name: gophprofile-pg-data
+  minio_data:
+    name: gophprofile-minio-data
+  rabbitmq_data:
+    name: gophprofile-rabbitmq-data
+
+networks:
+  gophprofile:
+    name: gophprofile-net
+    driver: bridge
