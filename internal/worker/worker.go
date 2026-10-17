@@ -109,11 +109,11 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		w.log.Info("shutting down worker...")
+		w.log.InfoContext(ctx, "shutting down worker...")
 		w.shutdownConsumers()
 		return nil
 	case err := <-errChan:
-		w.log.Error("consumer failed, shutting down", "error", err)
+		w.log.ErrorContext(ctx, "consumer failed, shutting down", "error", err)
 		w.shutdownConsumers()
 		return err
 	}

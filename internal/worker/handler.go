@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/services"
 	"github.com/b602op/avatars-service/internal/services/publisher"
 	"github.com/b602op/avatars-service/pkg/resizer"
@@ -58,7 +60,26 @@ func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz R
 // Ошибки S3/БД/ресайза — transient: consumer переотправит сообщение в очередь
 // и в итоге отправит в DLQ (ШАГ 7.4). Невалидный ID даёт publisher.PermanentError.
 // «Мягкие» случаи (аватар удалён, уже обработан) возвращают nil — сообщение ack.
-func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUploadEvent) error {
+//
+// Именованный err нужен defer'у с метрикой длительности обработки: он же
+// страхует панику — она наблюдается с меткой status="panic" и перебрасывается
+// дальше, чтобы падение не осталось незамеченным в логах.
+func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUploadEvent) (err error) {
+	start := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.AvatarsProcessingDuration.WithLabelValues(metrics.StatusPanic).
+				Observe(time.Since(start).Seconds())
+			panic(r)
+		}
+
+		status := metrics.StatusSuccess
+		if err != nil {
+			status = metrics.StatusError
+		}
+		metrics.AvatarsProcessingDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+	}()
+
 	avatarID, err := uuid.Parse(event.AvatarID)
 	if err != nil {
 		// Невалидный ID не станет валидным при повторе — сразу в DLQ.
@@ -69,7 +90,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			// Аватар уже удалён — обрабатывать нечего.
-			h.log.Warn("avatar not found (already deleted?)", "avatar_id", avatarID)
+			h.log.WarnContext(ctx, "avatar not found (already deleted?)", "avatar_id", avatarID)
 			return nil
 		}
 		return fmt.Errorf("worker: get avatar: %w", err)
@@ -77,7 +98,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 
 	// Идемпотентность: повторная доставка того же события не должна ничего делать.
 	if avatar.ProcessingStatus == domain.ProcessingStatusCompleted {
-		h.log.Debug("already processed, skipping", "avatar_id", avatarID)
+		h.log.DebugContext(ctx, "already processed, skipping", "avatar_id", avatarID)
 		return nil
 	}
 
@@ -117,7 +138,12 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 		return fmt.Errorf("worker: complete processing: %w", err)
 	}
 
-	h.log.Info("avatar processed", "avatar_id", avatarID, "thumbnails", len(thumbnails), "width", width, "height", height)
+	h.log.InfoContext(ctx, "avatar processed",
+		"avatar_id", avatarID,
+		"thumbnails", len(thumbnails),
+		"width", width,
+		"height", height,
+	)
 	return nil
 }
 
@@ -132,7 +158,7 @@ func (h *Handler) HandleDelete(ctx context.Context, event publisher.AvatarDelete
 	}
 
 	if len(event.S3Keys) == 0 {
-		h.log.Debug("no keys to delete, skipping", "avatar_id", avatarID)
+		h.log.DebugContext(ctx, "no keys to delete, skipping", "avatar_id", avatarID)
 		return nil
 	}
 
@@ -140,6 +166,6 @@ func (h *Handler) HandleDelete(ctx context.Context, event publisher.AvatarDelete
 		return fmt.Errorf("worker: delete avatar files: %w", err)
 	}
 
-	h.log.Info("avatar files deleted from s3", "avatar_id", avatarID, "count", len(event.S3Keys))
+	h.log.InfoContext(ctx, "avatar files deleted from s3", "avatar_id", avatarID, "count", len(event.S3Keys))
 	return nil
 }

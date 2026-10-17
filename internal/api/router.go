@@ -7,12 +7,18 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/b602op/avatars-service/internal/handlers"
 )
 
 // requestTimeout — верхняя граница времени обработки одного запроса.
 const requestTimeout = 30 * time.Second
+
+// otelOperation — имя операции для спанов HTTP-сервера. otelhttp уточняет имя
+// спана до "METHOD {маршрут}", как только Chi проставит r.Pattern, поэтому в
+// Jaeger виден шаблон маршрута, а не конкретный URL.
+const otelOperation = "http.server"
 
 // staticDir — директория со статикой веб-интерфейса (относительно рабочей).
 const staticDir = "web/static"
@@ -40,9 +46,22 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 
 	r := chi.NewRouter()
 
-	// Порядок middleware: снаружи внутрь. RequestID — первым, чтобы request_id
-	// был доступен логгеру; Recoverer — внутри логгера, чтобы паника попала в лог
-	// как 500. CORS — последним: он ставит заголовки до ухода в хендлер.
+	// Порядок middleware — снаружи внутрь, и он значим:
+	//
+	//  1. RequestID — request_id попадает в логи и в атрибуты спана;
+	//  2. RealIP — подменяет RemoteAddr до логирования;
+	//  3. otelhttp — создаёт спан на запрос. Всё, что зарегистрировано ниже,
+	//     видит активный span, поэтому логи получают trace_id/span_id.
+	//     /health исключён из трейсов (Docker healthcheck — не бизнес-трафик,
+	//     иначе Jaeger забивается мусором каждые 10 секунд). Метрики /health
+	//     при этом считаются — фильтр действует только на спаны;
+	//  4. RequestLogger — пишет лог уже с trace_id;
+	//  5. Recoverer — паника попадает в лог как 500, а не как разорванный ответ;
+	//  6. Timeout — верхняя граница обработки запроса;
+	//  7. Metrics — HTTP-метрики (RED). Обязательно после otelhttp: шаблон
+	//     маршрута доступен только после матчинга в Chi, то есть на возврате
+	//     из next.ServeHTTP;
+	//  8. CORS — заголовки ставятся до ухода в хендлер.
 	r.Use(middleware.RequestID)
 	// RealIP подменяет r.RemoteAddr значением из X-Forwarded-For / X-Real-IP.
 	// В chi v5 он помечен deprecated (GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp,
@@ -54,9 +73,21 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	// решение — доверять заголовкам лишь от известных прокси-адресов — требует
 	// отдельной настройки и вынесено в техдолг шага 11.1.
 	r.Use(middleware.RealIP) //nolint:staticcheck // SA1019: см. комментарий выше
+	r.Use(otelhttp.NewMiddleware(otelOperation,
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/health"
+		}),
+		otelhttp.WithSpanNameFormatter(func(_ string, req *http.Request) string {
+			if p := chi.RouteContext(req.Context()).RoutePattern(); p != "" {
+				return req.Method + " " + p
+			}
+			return req.Method + " " + req.URL.Path
+		}),
+	))
 	r.Use(RequestLogger(log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
+	r.Use(Metrics())
 	r.Use(CORS(deps.AllowedOrigins))
 
 	// Публичные маршруты (без X-User-ID).

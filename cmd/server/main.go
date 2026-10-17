@@ -16,12 +16,14 @@ import (
 	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services"
 	"github.com/b602op/avatars-service/internal/services/publisher"
 	"github.com/b602op/avatars-service/internal/services/s3"
 	"github.com/b602op/avatars-service/pkg/logger"
+	"github.com/b602op/avatars-service/pkg/telemetry"
 )
 
 const (
@@ -50,7 +52,9 @@ func main() {
 	}
 }
 
-func run() error {
+// run возвращает именованный err, чтобы отложенные shutdown-функции могли
+// присоединить свои ошибки к результату через errors.Join.
+func run() (err error) {
 	// .env необязателен: если файла нет — работаем с переменными окружения ОС.
 	// Если файл есть, но битый — падаем громко с понятной ошибкой.
 	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
@@ -62,7 +66,7 @@ func run() error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	log := logger.New(cfg.App.LogLevel)
+	log := logger.New(cfg.LogLevel, "server")
 	slog.SetDefault(log)
 
 	log.Info("starting server", "config", cfg.String())
@@ -75,6 +79,61 @@ func run() error {
 	)
 	defer stopSignals()
 
+	// Трейсинг: OTLP HTTP → Jaeger. Недоступность коллектора не фатальна:
+	// соединение устанавливается лениво, а ошибки экспорта уходят в наш slog
+	// через otel.SetErrorHandler.
+	tpShutdown, err := telemetry.Init(signalCtx, telemetry.Config{
+		Endpoint:       cfg.OTelEndpoint,
+		ServiceName:    cfg.OTelServiceName + "-server",
+		ServiceVersion: cfg.OTelServiceVersion,
+		Environment:    cfg.OTelEnvironment,
+	})
+	if err != nil {
+		return fmt.Errorf("init telemetry: %w", err)
+	}
+	// Трейсинг останавливается последним по времени: defer выполняется по LIFO,
+	// а этот зарегистрирован раньше остальных, поэтому к моменту flush уже
+	// остановлены HTTP-сервер, пул БД и publisher — их shutdown-спаны попадают
+	// в батч. Порядок менять не нужно.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(
+			context.WithoutCancel(signalCtx),
+			telemetry.ShutdownTimeout,
+		)
+		defer cancelShutdown()
+
+		// Трейсы — best-effort телеметрия: неудачный flush не должен
+		// менять код возврата и провоцировать рестарт контейнера.
+		if shutdownErr := tpShutdown(shutdownCtx); shutdownErr != nil {
+			log.Warn("telemetry shutdown failed", "error", shutdownErr)
+		}
+	}()
+
+	// /metrics живёт на отдельном порту: в основной Chi-роутер его не добавляем,
+	// иначе метрики стали бы доступны через публичный API. Падение этого сервера
+	// не должно ронять API — это вспомогательный сигнал, поэтому только логируем.
+	metricsSrv := api.NewMetricsServer(cfg.MetricsAddr, log, false)
+	go func() {
+		log.Info("metrics server listening", "addr", metricsSrv.Addr)
+		if serveErr := metricsSrv.ListenAndServe(); serveErr != nil &&
+			!errors.Is(serveErr, http.ErrServerClosed) {
+			log.Error("metrics server failed", "error", serveErr)
+		}
+	}()
+	// Регистрируется после трейсинга: defer выполняется по LIFO, поэтому
+	// метрики останавливаются раньше, чем досылается батч спанов.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(
+			context.WithoutCancel(signalCtx),
+			shutdownTimeout,
+		)
+		defer cancelShutdown()
+
+		if shutdownErr := metricsSrv.Shutdown(shutdownCtx); shutdownErr != nil {
+			err = errors.Join(err, fmt.Errorf("shutdown metrics server: %w", shutdownErr))
+		}
+	}()
+
 	// Контекст только для инициализации зависимостей.
 	initCtx, cancelInit := context.WithTimeout(context.Background(), initTimeout)
 	defer cancelInit()
@@ -85,6 +144,13 @@ func run() error {
 		return fmt.Errorf("failed to connect to postgres: %w", err)
 	}
 	defer pool.Close()
+
+	// Метрики пула отдаются вместе с HTTP-метриками на /metrics.
+	metrics.RegisterDBPoolMetrics(pool)
+
+	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
+	// Горутина завершается по signalCtx при остановке процесса.
+	go metrics.StartStorageUpdater(signalCtx, pool, log)
 
 	log.Info("postgres connected")
 

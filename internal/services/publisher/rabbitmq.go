@@ -11,7 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/b602op/avatars-service/internal/amqpx"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
 )
@@ -63,6 +68,15 @@ const (
 
 // Проверка на этапе компиляции, что реализация соответствует доменному интерфейсу.
 var _ domain.EventPublisher = (*RabbitMQPublisher)(nil)
+
+// tracer — трейсер для спанов публикации: у amqp091-go нет готовой OTel
+// инструментации, поэтому спан создаётся вручную, а trace context передаётся
+// получателю через заголовки сообщения.
+//
+// Переменная инициализируется при загрузке пакета, то есть до telemetry.Init.
+// Это безопасно: до установки SDK глобальный провайдер OTel отдаёт no-op
+// трейсеры и подменяет их на трейсеры SDK в otel.SetTracerProvider.
+var tracer = otel.Tracer("github.com/b602op/avatars-service/publisher")
 
 // RabbitMQPublisher публикует события аватарок в RabbitMQ.
 type RabbitMQPublisher struct {
@@ -266,24 +280,54 @@ func (p *RabbitMQPublisher) PublishAvatarDeleted(ctx context.Context, avatarID u
 }
 
 // publish сериализует событие и отправляет его в exchange с заданным routing key.
-func (p *RabbitMQPublisher) publish(ctx context.Context, routingKey, messageID string, event any) error {
+//
+// Помимо публикации, метод кладёт trace context в заголовки сообщения: воркер
+// извлечёт его и продолжит тот же трейс (спаны обработки станут дочерними к
+// HTTP-запросу на сервере, а не «сиротами»).
+func (p *RabbitMQPublisher) publish(ctx context.Context, routingKey, messageID string, event any) (err error) {
+	ctx, span := tracer.Start(ctx, "RabbitMQ.Publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemRabbitMQ,
+			semconv.MessagingDestinationName(p.exchange),
+			semconv.MessagingRabbitMQDestinationRoutingKey(routingKey),
+			semconv.MessagingMessageID(messageID),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	body, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("publisher: marshal %s event: %w", routingKey, err)
 	}
 
+	// Headers создаётся заранее: Inject пишет в карту и на nil-карте паникует.
+	// Если у события появятся собственные заголовки, дописывать их нужно сюда же,
+	// ДО инжекта, чтобы trace context не затирал чужие ключи (он их и не трогает,
+	// но порядок делает это очевидным).
 	msg := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    messageID, // для идемпотентности воркера
 		Timestamp:    time.Now(),
 		Body:         body,
+		Headers:      amqp.Table{},
 	}
 
-	if err := p.channel.PublishWithContext(ctx, p.exchange, routingKey, false, false, msg); err != nil {
+	// Trace context (traceparent/tracestate) — в заголовки: это и есть
+	// context propagation между server и worker.
+	otel.GetTextMapPropagator().Inject(ctx, amqpx.HeaderCarrier(msg.Headers))
+
+	if err = p.channel.PublishWithContext(ctx, p.exchange, routingKey, false, false, msg); err != nil {
 		return fmt.Errorf("publisher: publish %s: %w", routingKey, err)
 	}
 
-	p.log.Debug("published "+routingKey, "message_id", messageID)
+	p.log.DebugContext(ctx, "published "+routingKey, "message_id", messageID)
 	return nil
 }
