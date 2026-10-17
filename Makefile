@@ -5,7 +5,7 @@ SHELL := /bin/sh
 COMPOSE := docker compose -f docker/docker-compose.yml --env-file .env
 GO := go
 
-.PHONY: help check-env check-docker up up-no-wait up-infra down down-v restart \
+.PHONY: help check-env check-docker up up-no-wait up-infra up-observ down down-v restart \
         rebuild-app logs logs-server logs-worker logs-infra ps config \
         build build-binaries build-images \
         test test-v test-cover test-race lint vet fmt fmt-check clean clean-all \
@@ -45,6 +45,9 @@ up-no-wait: check-docker ## Запустить весь стек без ожид
 
 up-infra: check-docker ## Запустить только инфраструктуру (postgres, minio, rabbitmq)
 	$(COMPOSE) up -d --wait --wait-timeout 120 postgres minio rabbitmq
+
+up-observ: check-docker ## Запустить только стек наблюдаемости (jaeger, prometheus, grafana, loki, promtail)
+	$(COMPOSE) up -d --wait prometheus jaeger grafana loki promtail
 
 down: check-docker ## Остановить контейнеры, сохранив данные
 	$(COMPOSE) down

@@ -1,0 +1,66 @@
+# Конфигурация Promtail для GophProfile.
+#
+# Источник логов — docker-сокет (docker_sd_configs), а не файлы на диске:
+# promtail сам находит контейнеры через Docker API. Портов у сервиса нет,
+# наружу он ничего не отдаёт.
+#
+# filters ограничивает обнаружение контейнерами ЭТОГО проекта: без него
+# promtail собрал бы логи всех контейнеров хоста, включая чужие.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=gophprofile"]
+    relabel_configs:
+      # Логи инфраструктуры (postgres/minio/rabbitmq/...) не нужны: оставляем
+      # только приложение. Лейбл содержит имя сервиса из compose.
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        regex: '(server|worker)'
+        action: keep
+
+      # service — тот же лейбл, что в метриках и спанах: по нему строятся
+      # выборки {service="server"}.
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+
+      # Имя контейнера без ведущего слэша (Docker отдаёт "/gophprofile-server").
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+    pipeline_stages:
+      # Разбирает docker-обёртку (поток + время) и оставляет само сообщение.
+      - docker: {}
+      # Приложение пишет JSON (slog) — поднимаем поля в метки, чтобы работали
+      # выборки | json | trace_id="..." без ручного парсинга.
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            trace_id: trace_id
+            span_id: span_id
+            service: service
+          # Не-JSON строки (например, стартовый вывод самой инфраструктуры)
+          # не роняют пайплайн: строка просто уходит без меток.
+          drop_malformed: false
+      - labels:
+          level:
+          trace_id:
+          span_id:
+          service:
