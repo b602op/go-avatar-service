@@ -15,6 +15,11 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
@@ -22,6 +27,17 @@ import (
 
 // defaultContentType применяется, когда вызывающая сторона не задала MIME-тип.
 const defaultContentType = "application/octet-stream"
+
+// tracer — трейсер для ручных спанов S3: у minio-go нет готовой OTel-инструментации,
+// поэтому спаны операций создаются вручную.
+//
+// Спаны помечаются как SpanKindClient: каждая операция — исходящий вызов
+// внешнего хранилища, и в трейсе это отдельный узел рядом с SQL-спанами.
+//
+// Переменная инициализируется при загрузке пакета, то есть до telemetry.Init.
+// Это безопасно: глобальный провайдер OTel отдаёт до установки SDK no-op трейсеры
+// и подменяет их на трейсеры SDK в момент otel.SetTracerProvider.
+var tracer = otel.Tracer("github.com/b602op/avatars-service/s3")
 
 // Проверка на этапе компиляции, что Client реализует доменный интерфейс.
 var _ domain.ObjectStorage = (*Client)(nil)
@@ -70,7 +86,19 @@ func New(cfg config.S3Config, log *slog.Logger) (*Client, error) {
 // EnsureBucket создаёт бакет, если его ещё нет.
 //
 // Метод идемпотентен: повторный вызов на существующем бакете не является ошибкой.
-func (c *Client) EnsureBucket(ctx context.Context) error {
+func (c *Client) EnsureBucket(ctx context.Context) (err error) {
+	ctx, span := tracer.Start(ctx, "S3.EnsureBucket",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(semconv.AWSS3Bucket(c.bucket)),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	exists, err := c.mc.BucketExists(ctx, c.bucket)
 	if err != nil {
 		return fmt.Errorf("s3: check bucket %q: %w", c.bucket, err)
@@ -98,7 +126,24 @@ func (c *Client) EnsureBucket(ctx context.Context) error {
 // size должен быть точным размером данных: потоковая загрузка неизвестной длины
 // (size = -1) не поддерживается. Если contentType пустой, применяется
 // "application/octet-stream".
-func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64, contentType string) (err error) {
+	ctx, span := tracer.Start(ctx, "S3.Upload",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.AWSS3Bucket(c.bucket),
+			semconv.AWSS3Key(key),
+			attribute.Int64("s3.size", size),
+			attribute.String("s3.content_type", contentType),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	if size < 0 {
 		return fmt.Errorf("s3: upload %q: exact size is required, got %d", key, size)
 	}
@@ -106,7 +151,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64
 		contentType = defaultContentType
 	}
 
-	_, err := c.mc.PutObject(ctx, c.bucket, key, r, size, minio.PutObjectOptions{
+	_, err = c.mc.PutObject(ctx, c.bucket, key, r, size, minio.PutObjectOptions{
 		ContentType: contentType,
 	})
 	if err != nil {
@@ -120,7 +165,22 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64
 //
 // Если объекта нет — domain.ErrNotFound. Вызывающая сторона обязана закрыть
 // возвращённый io.ReadCloser.
-func (c *Client) Download(ctx context.Context, key string) (io.ReadCloser, *domain.ObjectInfo, error) {
+func (c *Client) Download(ctx context.Context, key string) (rc io.ReadCloser, info *domain.ObjectInfo, err error) {
+	ctx, span := tracer.Start(ctx, "S3.Download",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.AWSS3Bucket(c.bucket),
+			semconv.AWSS3Key(key),
+		),
+	)
+	defer func() {
+		if err != nil && !errors.Is(err, domain.ErrNotFound) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		if isNotFound(err) {
@@ -130,7 +190,7 @@ func (c *Client) Download(ctx context.Context, key string) (io.ReadCloser, *doma
 	}
 
 	// GetObject ленив: ошибка отсутствующего объекта всплывает только при Stat.
-	info, err := obj.Stat()
+	stat, err := obj.Stat()
 	if err != nil {
 		_ = obj.Close()
 		if isNotFound(err) {
@@ -139,27 +199,57 @@ func (c *Client) Download(ctx context.Context, key string) (io.ReadCloser, *doma
 		return nil, nil, fmt.Errorf("s3: download %q: %w", key, err)
 	}
 
-	return obj, toObjectInfo(info), nil
+	return obj, toObjectInfo(stat), nil
 }
 
 // StatObject возвращает метаданные объекта. Если объекта нет — domain.ErrNotFound.
-func (c *Client) StatObject(ctx context.Context, key string) (*domain.ObjectInfo, error) {
-	info, err := c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
+func (c *Client) StatObject(ctx context.Context, key string) (info *domain.ObjectInfo, err error) {
+	ctx, span := tracer.Start(ctx, "S3.StatObject",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.AWSS3Bucket(c.bucket),
+			semconv.AWSS3Key(key),
+		),
+	)
+	defer func() {
+		if err != nil && !errors.Is(err, domain.ErrNotFound) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	stat, err := c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, domain.ErrNotFound
 		}
 		return nil, fmt.Errorf("s3: stat %q: %w", key, err)
 	}
-	return toObjectInfo(info), nil
+	return toObjectInfo(stat), nil
 }
 
 // Delete удаляет объект.
 //
 // Отсутствие объекта не является ошибкой: S3 отвечает успехом на удаление
 // несуществующего ключа, поэтому метод идемпотентен.
-func (c *Client) Delete(ctx context.Context, key string) error {
-	if err := c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+func (c *Client) Delete(ctx context.Context, key string) (err error) {
+	ctx, span := tracer.Start(ctx, "S3.Delete",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.AWSS3Bucket(c.bucket),
+			semconv.AWSS3Key(key),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	if err = c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("s3: delete %q: %w", key, err)
 	}
 	return nil
@@ -169,7 +259,24 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 //
 // Ошибки отдельных ключей логируются и объединяются в одну ошибку, но не
 // прерывают batch: так за один вызов удаляется максимум объектов.
-func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
+func (c *Client) DeleteMany(ctx context.Context, keys []string) (err error) {
+	ctx, span := tracer.Start(ctx, "S3.DeleteMany",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.AWSS3Bucket(c.bucket),
+			// Только количество ключей: сами ключи раздули бы спан, а как
+			// атрибут с высокой кардинальностью были бы бесполезны в выборках.
+			attribute.Int("s3.key_count", len(keys)),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	if len(keys) == 0 {
 		return nil
 	}
@@ -192,7 +299,19 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
 
 // HealthCheck проверяет доступность хранилища и наличие бакета.
 // Используется в /health (ШАГ 8).
-func (c *Client) HealthCheck(ctx context.Context) error {
+func (c *Client) HealthCheck(ctx context.Context) (err error) {
+	ctx, span := tracer.Start(ctx, "S3.HealthCheck",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(semconv.AWSS3Bucket(c.bucket)),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	exists, err := c.mc.BucketExists(ctx, c.bucket)
 	if err != nil {
 		return fmt.Errorf("s3: health check: %w", err)
