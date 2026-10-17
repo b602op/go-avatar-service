@@ -148,6 +148,10 @@ func run() (err error) {
 	// Метрики пула отдаются вместе с HTTP-метриками на /metrics.
 	metrics.RegisterDBPoolMetrics(pool)
 
+	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
+	// Горутина завершается по signalCtx при остановке процесса.
+	go metrics.StartStorageUpdater(signalCtx, pool, log)
+
 	log.Info("postgres connected")
 
 	// Миграции применяются при старте

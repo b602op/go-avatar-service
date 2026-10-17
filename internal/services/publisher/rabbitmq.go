@@ -328,6 +328,6 @@ func (p *RabbitMQPublisher) publish(ctx context.Context, routingKey, messageID s
 		return fmt.Errorf("publisher: publish %s: %w", routingKey, err)
 	}
 
-	p.log.Debug("published "+routingKey, "message_id", messageID)
+	p.log.DebugContext(ctx, "published "+routingKey, "message_id", messageID)
 	return nil
 }

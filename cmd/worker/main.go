@@ -141,6 +141,10 @@ func main() {
 	// Метрики пула воркера — на его собственном порту метрик (:9091).
 	metrics.RegisterDBPoolMetrics(pool)
 
+	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
+	// Горутина завершается по ctx при остановке процесса.
+	go metrics.StartStorageUpdater(ctx, pool, log)
+
 	log.Info("postgres connected")
 
 	// Миграции применяются при старте

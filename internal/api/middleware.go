@@ -41,12 +41,17 @@ var (
 // Успешные запросы (status < 500) пишутся на уровне Info, серверные ошибки —
 // на уровне Error. Поля: method, path, status, duration, request_id, remote_addr.
 // Требует, чтобы middleware.RequestID был установлен раньше (для request_id).
+//
+// Логи пишутся через *Context: к этому моменту (после otelhttp) в контексте
+// запроса лежит активный спан, и traceAwareHandler добавляет в запись trace_id
+// и span_id. Именно это связывает лог с трейсом в Jaeger.
 func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
@@ -58,13 +63,13 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 				"path", r.URL.Path,
 				"status", status,
 				"duration", time.Since(start),
-				"request_id", middleware.GetReqID(r.Context()),
+				"request_id", middleware.GetReqID(ctx),
 				"remote_addr", r.RemoteAddr,
 			}
 			if status >= http.StatusInternalServerError {
-				log.Error("http request", attrs...)
+				log.ErrorContext(ctx, "http request", attrs...)
 			} else {
-				log.Info("http request", attrs...)
+				log.InfoContext(ctx, "http request", attrs...)
 			}
 		})
 	}

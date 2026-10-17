@@ -138,53 +138,56 @@ func (c *Consumer) handleMessage(ctx context.Context, msg amqp.Delivery) {
 
 	if err == nil {
 		if ackErr := msg.Ack(false); ackErr != nil {
-			c.log.Error("failed to ack message", "queue", c.queue, "error", ackErr)
+			c.log.ErrorContext(msgCtx, "failed to ack message", "queue", c.queue, "error", ackErr)
 		}
 		return
 	}
 
 	var permErr *publisher.PermanentError
 	if errors.As(err, &permErr) {
-		c.log.Error("permanent error, sending to DLQ",
+		c.log.ErrorContext(msgCtx, "permanent error, sending to DLQ",
 			"queue", c.queue, "error", err, "message_id", msg.MessageId)
-		c.nackToDLQ(msg)
+		c.nackToDLQ(msgCtx, msg)
 		return
 	}
 
 	retryCount := countRetries(msg.Headers)
 	if retryCount >= maxRetries {
-		c.log.Error("max retries exceeded, sending to DLQ",
+		c.log.ErrorContext(msgCtx, "max retries exceeded, sending to DLQ",
 			"queue", c.queue, "error", err, "retry_count", retryCount, "message_id", msg.MessageId)
-		c.nackToDLQ(msg)
+		c.nackToDLQ(msgCtx, msg)
 		return
 	}
 
 	// Transient-ошибка: откладываем через retry-очередь с TTL.
-	c.log.Warn("transient error, sending to retry queue",
+	c.log.WarnContext(msgCtx, "transient error, sending to retry queue",
 		"queue", c.queue, "error", err, "retry_count", retryCount, "message_id", msg.MessageId)
 
 	// msgCtx, а не ctx: в нём есть trace context из заголовков, поэтому трейс
 	// не обрывается на повторной публикации.
 	if pubErr := c.publishToRetry(msgCtx, msg); pubErr != nil {
 		// Retry-публикация не удалась — оставляем сообщение в очереди (worst case).
-		c.log.Error("failed to publish to retry queue, requeueing",
+		c.log.ErrorContext(msgCtx, "failed to publish to retry queue, requeueing",
 			"queue", c.queue, "error", pubErr, "message_id", msg.MessageId)
 		if nackErr := msg.Nack(false, true); nackErr != nil {
-			c.log.Error("failed to nack message", "queue", c.queue, "error", nackErr)
+			c.log.ErrorContext(msgCtx, "failed to nack message", "queue", c.queue, "error", nackErr)
 		}
 		return
 	}
 
 	// Исходное сообщение подтверждаем: за отложенный повтор отвечает retry-очередь.
 	if ackErr := msg.Ack(false); ackErr != nil {
-		c.log.Error("failed to ack message", "queue", c.queue, "error", ackErr)
+		c.log.ErrorContext(msgCtx, "failed to ack message", "queue", c.queue, "error", ackErr)
 	}
 }
 
 // nackToDLQ отклоняет сообщение без возврата в очередь: сработает dead-lettering.
-func (c *Consumer) nackToDLQ(msg amqp.Delivery) {
+//
+// ctx — msgCtx из handleMessage: в нём есть trace context из заголовков, поэтому
+// запись о неудачном nack попадает в тот же трейс, что и обработка сообщения.
+func (c *Consumer) nackToDLQ(ctx context.Context, msg amqp.Delivery) {
 	if nackErr := msg.Nack(false, false); nackErr != nil {
-		c.log.Error("failed to nack message", "queue", c.queue, "error", nackErr)
+		c.log.ErrorContext(ctx, "failed to nack message", "queue", c.queue, "error", nackErr)
 	}
 }
 

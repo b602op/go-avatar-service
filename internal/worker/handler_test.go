@@ -22,6 +22,7 @@ import (
 
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services"
 	"github.com/b602op/avatars-service/internal/services/publisher"
@@ -483,6 +484,34 @@ func TestHandler_HandleUpload_InvalidImage(t *testing.T) {
 	assert.Equal(t, domain.ProcessingStatusPending, got.ProcessingStatus)
 	assert.Nil(t, got.Width)
 	assert.Nil(t, got.Height)
+}
+
+// TestHandler_HandleUpload_Panic проверяет, что паника внутри обработки не
+// теряется: она фиксируется метрикой отдельной серией status="panic" (падение
+// воркера не должно выглядеть как обычная ошибка обработки) и пробрасывается
+// наверх — её ловит runConsumer в worker.go и роняет процесс.
+//
+// Инфраструктура не нужна: репозиторий-стаб паникует ещё до обращения к S3,
+// поэтому тест выполняется и при недоступных контейнерах (см. TestMain).
+func TestHandler_HandleUpload_Panic(t *testing.T) {
+	before := processingSamples(t, metrics.StatusPanic)
+
+	// Паникуем на самом первом обращении к БД внутри HandleUpload.
+	repo := &stubRepo{getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
+		panic("boom")
+	}}
+	h := NewHandler(repo, stubStorage{}, &mockResizer{}, testLogger())
+
+	assert.Panics(t, func() {
+		_ = h.HandleUpload(context.Background(), uploadEvent(&domain.Avatar{
+			ID:     uuid.New(),
+			UserID: "user-1",
+			S3Key:  "originals/user-1/x/photo.jpg",
+		}))
+	})
+
+	assert.Greater(t, processingSamples(t, metrics.StatusPanic), before,
+		"паника должна наблюдаться с меткой status=%q", metrics.StatusPanic)
 }
 
 // ─── HandleDelete ───────────────────────────────────────────────────────────

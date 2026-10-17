@@ -104,7 +104,7 @@ func (c *Client) EnsureBucket(ctx context.Context) (err error) {
 		return fmt.Errorf("s3: check bucket %q: %w", c.bucket, err)
 	}
 	if exists {
-		c.log.Debug("s3 bucket already exists", "bucket", c.bucket)
+		c.log.DebugContext(ctx, "s3 bucket already exists", "bucket", c.bucket)
 		return nil
 	}
 
@@ -117,7 +117,7 @@ func (c *Client) EnsureBucket(ctx context.Context) (err error) {
 		return fmt.Errorf("s3: create bucket %q: %w", c.bucket, err)
 	}
 
-	c.log.Info("s3 bucket created", "bucket", c.bucket)
+	c.log.InfoContext(ctx, "s3 bucket created", "bucket", c.bucket)
 	return nil
 }
 
@@ -155,7 +155,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64
 		ContentType: contentType,
 	})
 	if err != nil {
-		c.log.Debug("s3 upload failed", "key", key, "error", err)
+		c.log.DebugContext(ctx, "s3 upload failed", "key", key, "error", err)
 		return fmt.Errorf("s3: upload %q: %w", key, err)
 	}
 	return nil
@@ -291,7 +291,7 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) (err error) {
 
 	var errs []error
 	for res := range c.mc.RemoveObjects(ctx, c.bucket, objectsCh, minio.RemoveObjectsOptions{}) {
-		c.log.Warn("s3 batch delete failed", "key", res.ObjectName, "error", res.Err)
+		c.log.WarnContext(ctx, "s3 batch delete failed", "key", res.ObjectName, "error", res.Err)
 		errs = append(errs, fmt.Errorf("delete %q: %w", res.ObjectName, res.Err))
 	}
 	return errors.Join(errs...)
