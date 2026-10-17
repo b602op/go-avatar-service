@@ -14,6 +14,7 @@ import (
 
 	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services/publisher"
@@ -136,6 +137,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Метрики пула воркера — на его собственном порту метрик (:9091).
+	metrics.RegisterDBPoolMetrics(pool)
+
 	log.Info("postgres connected")
 
 	// Миграции применяются при старте

@@ -16,6 +16,7 @@ import (
 	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services"
@@ -143,6 +144,9 @@ func run() (err error) {
 		return fmt.Errorf("failed to connect to postgres: %w", err)
 	}
 	defer pool.Close()
+
+	// Метрики пула отдаются вместе с HTTP-метриками на /metrics.
+	metrics.RegisterDBPoolMetrics(pool)
 
 	log.Info("postgres connected")
 
