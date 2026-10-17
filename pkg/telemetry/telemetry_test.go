@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // TestInit_CollectorUnavailable проверяет главное требование: недоступность
@@ -42,6 +44,35 @@ func TestInit_EndpointWithoutScheme(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, shutdown(ctx))
+}
+
+// TestInit_SetsPropagator проверяет, что Init настраивает глобальный пропагатор:
+// без него Inject/Extract молча ничего не делают (по умолчанию — no-op), и
+// trace context не переживает границу процесса (HTTP → RabbitMQ → worker).
+func TestInit_SetsPropagator(t *testing.T) {
+	shutdown, err := Init(context.Background(), Config{
+		Endpoint:    "http://localhost:14318",
+		ServiceName: "avatars-test",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Cleanup(func() { _ = shutdown(ctx) })
+
+	ctx, span := otel.Tracer("test").Start(ctx, "test-span")
+	defer span.End()
+
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
+	require.Contains(t, carrier, "traceparent", "trace context не инжектится в заголовки")
+
+	extracted := trace.SpanContextFromContext(
+		otel.GetTextMapPropagator().Extract(context.Background(), carrier),
+	)
+	require.True(t, extracted.IsValid(), "trace context не извлекается из заголовков")
+	require.Equal(t, span.SpanContext().TraceID(), extracted.TraceID())
 }
 
 // TestShutdown_SlowCollectorIsBounded проверяет сценарий «экспорт дольше

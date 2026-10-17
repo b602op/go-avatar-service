@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
@@ -83,6 +84,16 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	)
 
 	otel.SetTracerProvider(tp)
+
+	// Пропагатор — обязательная часть распределённого трейсинга: без него
+	// Inject/Extract молча ничего не делают (глобальный пропагатор по умолчанию
+	// no-op), и трейс рвётся на любой границе процесса: HTTP → RabbitMQ → worker.
+	// W3C Trace Context — де-факто стандарт заголовка traceparent; Baggage нужен,
+	// чтобы вместе с трейсом переносились пользовательские пары ключ-значение.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	// Ошибки самого SDK (например, неудачная отправка батча) направляем в наш
 	// slog, чтобы они попадали в общий JSON-лог, а не терялись в stderr.
