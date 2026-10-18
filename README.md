@@ -364,6 +364,55 @@ healthcheck обращается к нему каждые 15 секунд, и Ja
 `messaging.destination.name`, `messaging.rabbitmq.destination.routing_key`,
 `messaging.message.id`.
 
+## Kubernetes — мониторинг (ServiceMonitor)
+
+`k8s/50-servicemonitor.yaml` — **артефакт для Prometheus Operator**, в локальном
+кластере он не применяется. Манифест описан в терминах CRD
+`monitoring.coreos.com/v1`, которых в minikube нет: полный
+`kube-prometheus-stack` требует 2–3 GB RAM, а у ноды 6 GB, из которых ~1.5 GB
+занимают приложение и инфраструктура. Поэтому файл лежит в репозитории как
+готовый к продакшену объект (для ревьюера), а не как часть рабочего стенда.
+
+В проде:
+
+```bash
+# 1. Стек оператора
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace
+
+# 2. ServiceMonitor'ы для server и worker
+kubectl apply -f k8s/50-servicemonitor.yaml
+
+# 3. Проверка: Prometheus → Status → Targets (или)
+kubectl get servicemonitor -n gophprofile
+```
+
+Дальше Prometheus обнаруживает поды `server` и `worker` сам и скрейпит
+`/metrics` каждые 30 секунд — без правок scrape-конфига и перезапуска
+Prometheus.
+
+Что важно в манифесте:
+
+- `selector.matchLabels: app: server` / `app: worker` — ServiceMonitor выбирает
+  не поды, а Service, поэтому метки должны быть на Service (они есть в
+  `k8s/20-server.yaml` и `k8s/21-worker.yaml`);
+- `endpoints.port: metrics` — **именованный** порт Service (`- name: metrics,
+  port: 9090` у server, `9091` у worker): при смене номера порта джоба не
+  развалится;
+- `labels.release: kube-prometheus-stack` — селектор Prometheus из
+  kube-prometheus-stack по умолчанию берёт только ServiceMonitor с меткой
+  `release`, равной имени helm-релиза. Если релиз назван иначе — поправить.
+
+Метрики (добавлены в iter2) отдаются на `/metrics`: `:9090` у server,
+`:9091` у worker — те же, что собираются в Docker-стенде. Пока оператора нет,
+в локальном кластере метрики снимаются вручную:
+
+```bash
+kubectl port-forward -n gophprofile svc/server 9090:9090
+curl http://localhost:9090/metrics
+```
+
 ## Веб-интерфейс
 
 Простой одностраничный веб-интерфейс для загрузки аватарок доступен по адресу `http://localhost:8080/web/upload`. Он находится в файле `web/static/index.html`.

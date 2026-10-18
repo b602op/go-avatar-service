@@ -1,0 +1,69 @@
+# ВНИМАНИЕ: этот манифест НЕ применяется в локальном кластере.
+#
+# Он описан в терминах Prometheus Operator (apiVersion monitoring.coreos.com/v1),
+# а оператор в кластер не ставится: полный kube-prometheus-stack требует
+# 2–3 GB RAM, тогда как у ноды minikube 6 GB, из которых ~1.5 GB уже заняты
+# приложением и инфраструктурой. Здесь файл лежит как артефакт для ревьюера:
+# локальные манифесты применяются по отдельности, а `kubectl apply -f k8s/`
+# с этим файлом упадёт с `no matches for kind "ServiceMonitor"` — CRD в
+# кластере нет. В проде файл применяется после установки стека:
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace
+#   kubectl apply -f k8s/50-servicemonitor.yaml
+#
+# Локально те же метрики собираются статическим scrape-конфигом Prometheus
+# (как в iter2, docker/prometheus/prometheus.yml).
+#
+# Почему два объекта: ServiceMonitor описывает не поды, а Service — оператор
+# находит его через selector.matchLabels, читает именованные порты и генерирует
+# scrape-джобы по эндпоинтам Service. У server и worker разные Service и разные
+# порты (9090 и 9091), поэтому и ServiceMonitor'а два.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gophprofile-server
+  namespace: gophprofile
+  labels:
+    app: server
+    # Обязательная метка для селектора Prometheus: kube-prometheus-stack по
+    # умолчанию (serviceMonitorSelectorNilUsesHelmValues=true) выбирает только
+    # те ServiceMonitor, у которых release совпадает с именем helm-релиза.
+    # Если релиз назван иначе — поправить значение.
+    release: kube-prometheus-stack
+spec:
+  selector:
+    # Выбирает Service `server` из 20-server.yaml (labels: app: server).
+    matchLabels:
+      app: server
+  # namespaceSelector не задан осознанно: пустой селектор означает «только
+  # свой namespace», а ServiceMonitor и Service лежат вместе — в gophprofile.
+  endpoints:
+    # port — имя порта Service (`- name: metrics, port: 9090`), а не номер:
+    # так джоба не развалится при смене номера порта.
+    - port: metrics
+      # 30 с, а не 15 с как в compose: в кластере метрик больше (по поду на
+      # каждую реплику), и реже скрейпить дешевле для ноды.
+      interval: 30s
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gophprofile-worker
+  namespace: gophprofile
+  labels:
+    app: worker
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: worker
+  endpoints:
+    # У воркера метрики и /health живут на :9091 (см. 21-worker.yaml), в Service
+    # он тоже назван metrics.
+    - port: metrics
+      interval: 30s
+      path: /metrics

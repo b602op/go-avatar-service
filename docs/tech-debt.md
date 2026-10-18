@@ -111,3 +111,18 @@ deprecated (GHSA-3fxj-6jh8-hvhx и др.): без списка доверенн�
   Ревьюер рекомендовал передавать коллекторы через структуру
   (`type Metrics struct { ... }`, `NewMetrics(reg prometheus.Registerer)`),
   чтобы зависимости были явными и метрики можно было инжектить в тестах.
+
+## Kubernetes (iter3)
+
+### ServiceMonitor не применён в локальном кластере (P2)
+
+Требует Prometheus Operator (CRD `monitoring.coreos.com/v1`). Локально нода
+minikube — 6 GB RAM, приложение и инфраструктура занимают ~1.5 GB, а стек
+оператора (`kube-prometheus-stack`) требует ещё 2–3 GB, поэтому он не
+устанавливается. Артефакт готов (`k8s/50-servicemonitor.yaml`), в проде —
+применять после установки стека.
+
+Альтернатива для локального стенда: статический scrape в `prometheus.yml`
+(как в iter2) — джобы `server:9090` и `worker:9091` в
+`docker/prometheus/prometheus.yml`; в кластере те же `/metrics` снимаются
+`kubectl port-forward -n gophprofile svc/server 9090:9090`.
