@@ -1,0 +1,41 @@
+# Ingress для HTTP-сервера: единственная точка входа в кластер.
+#
+# Доступ снаружи организует ingress-nginx (addon minikube): контроллер слушает
+# NodePort 30881 и проксирует запросы к Service server по правилу ниже.
+# Воркер здесь намеренно отсутствует — публичного HTTP API у него нет, наружу
+# отдаётся только /health и /metrics на 9091, и они нужны внутри кластера
+# (Prometheus на Шаге 3).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gophprofile-ingress
+  namespace: gophprofile
+  annotations:
+    # Лимит размера тела запроса. Дефолт nginx — 1m, а приложение принимает
+    # файлы до 10 МБ (services.MaxFileSize): без этой аннотации загрузка
+    # отваливалась бы на стороне прокси с 413 ещё до хендлера, и собственный
+    # ответ приложения «File too large» был бы недостижим.
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  # ingressClassName, а не устаревшая аннотация kubernetes.io/ingress.class.
+  # Класс nginx в minikube помечен как default, но указываем явно: иначе
+  # Ingress зависел бы от того, какой контроллер в кластере окажется дефолтным.
+  ingressClassName: nginx
+  rules:
+    # gophprofile.local — имя для локальной проверки. Внешнего DNS нет,
+    # поэтому хост резолвится через /etc/hosts либо подменяется заголовком
+    # Host в curl. Указывать его всё равно нужно: без host правило ловило бы
+    # вообще весь трафик контроллера.
+    - host: gophprofile.local
+      http:
+        paths:
+          - path: /
+            # Prefix, а не Exact: под одним хостом живут и API (/api/v1/...),
+            # и веб-интерфейс (/web/upload), и статика (/web/static/...).
+            pathType: Prefix
+            backend:
+              service:
+                name: server
+                port:
+                  # Порт Service (80), а не порт контейнера (8080).
+                  number: 80

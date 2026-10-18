@@ -1,0 +1,103 @@
+# RabbitMQ: StatefulSet с локальным PVC.
+#
+# Очереди, обменники и привязки — состояние, поэтому StatefulSet: при
+# пересоздании пода он возвращается к своему тому, а не теряет очереди.
+#
+# Порт 15692 (экспортёр метрик) уже поднят образом -management: плагин
+# rabbitmq_prometheus включён в нём по умолчанию. Порт объявлен в Service,
+# чтобы на Шаге 3 его можно было указать целью скрейпа Prometheus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: gophprofile
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672
+    - name: metrics
+      port: 15692
+      targetPort: 15692
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: gophprofile
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management-alpine
+          ports:
+            - containerPort: 5672
+            - containerPort: 15672
+            - containerPort: 15692
+          # RABBITMQ_DEFAULT_USER / RABBITMQ_DEFAULT_PASS: брокер создаёт этого
+          # пользователя при первой инициализации тома.
+          envFrom:
+            - secretRef:
+                name: gophprofile-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          # check_port_connectivity, а не ping: 'ping' отвечает успехом, как
+          # только поднялся Erlang-узел, а AMQP-листенер открывается на 3-4
+          # секунды позже. Проверка листенеров означает «порт принимает
+          # соединения» — именно это нужно и пробе, и приложению.
+          #
+          # Периоды и таймауты заданы явно, потому что дефолты для этой проверки
+          # непригодны. Каждый вызов rabbitmq-diagnostics поднимает Erlang CLI
+          # (замерено ~7 секунд на этой ноде, причём та же цена и у -q ping:
+          # дорого не сравнение портов, а запуск CLI). Отсюда два следствия:
+          #  * timeoutSeconds по умолчанию (1 с) недостижим — liveness не
+          #    проходил никогда, и kubelet убивал контейнер по кругу;
+          #  * periodSeconds 5-10 с означают, что проверки идут непрерывно:
+          #    при лимите CPU 500m брокер стабильно съедал ~375m на одни пробы.
+          # С периодами ниже пробы идут 3 раза в минуту, а не 18.
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 15
+            # Брокер стартует ~35 секунд; три подряд неудачи дают запас, чтобы
+            # liveness не мешал старту.
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 15
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

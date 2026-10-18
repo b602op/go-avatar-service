@@ -1,0 +1,146 @@
+# HTTP-сервер: Deployment на 2 реплики.
+#
+# Deployment, а не StatefulSet: сервер не хранит состояние — метаданные в
+# PostgreSQL, файлы в S3. Реплики взаимозаменяемы, поэтому достаточно обычного
+# Service с балансировкой.
+#
+# Миграции каждая реплика применяет при старте сама (internal/migrator).
+# Одновременный старт безопасен: goose берёт session-level advisory lock,
+# поэтому второй под просто ждёт, пока первый закончит.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: gophprofile
+  labels:
+    app: server
+spec:
+  selector:
+    app: server
+  ports:
+    # 80 → 8080: снаружи удобнее обращаться к сервису по стандартному порту
+    # (Ingress на Шаге 1.2 будет целиться именно в него).
+    - name: http
+      port: 80
+      targetPort: 8080
+    # Метрики отдельным портом: их будет скрейпить Prometheus (Шаг 3),
+    # а не пользовательский трафик.
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: gophprofile
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: server
+  template:
+    metadata:
+      labels:
+        app: server
+    spec:
+      # Аналог `depends_on: {condition: service_healthy}` из docker-compose.yml.
+      # В Kubernetes такого условия нет, а приложение не ретраит подключения:
+      # если брокер или хранилище ещё не принимают соединения, процесс падает
+      # на старте и уходит в CrashLoopBackOff. RabbitMQ поднимается ~35 секунд,
+      # поэтому при первом `kubectl apply` это гарантированный сценарий.
+      #
+      # Проверка через nc, а не через HTTP: она одинаково работает для AMQP
+      # (5672) и S3 (9000), которым health-эндпоинты не нужны.
+      initContainers:
+        - name: wait-for-dependencies
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for target in postgres:5432 minio:9000 rabbitmq:5672; do
+                host=${target%:*}
+                port=${target#*:}
+                until nc -w 2 "$host" "$port" </dev/null; do
+                  echo "waiting for $host:$port"
+                  sleep 2
+                done
+                echo "$host:$port is ready"
+              done
+      containers:
+        - name: server
+          image: gophprofile-server:latest
+          # Образы собираются локально (Dockerfile, target server) и загружаются
+          # в кластер — minikube image load gophprofile-server:latest. В реестр
+          # за ними ходить не нужно: Always заставлял бы kubelet каждый раз
+          # пытаться скачать их из Docker Hub.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+            - containerPort: 9090
+          # Несекретная конфигурация + учётные данные. Значения из env ниже
+          # переопределяют одноимённые ключи secretRef (POSTGRES_* и S3_*),
+          # чтобы явно было видно, что именно нужно приложению.
+          envFrom:
+            - configMapRef:
+                name: gophprofile-config
+            - secretRef:
+                name: gophprofile-secrets
+          env:
+            - name: HTTP_PORT
+              value: "8080"
+            # Воркер использует :9091, поэтому у сервера метрики остаются на
+            # дефолтном :9090 — иначе два процесса в одном поде конфликтовали бы
+            # (в кластере это разные Deployment'ы, но адрес задан явно).
+            - name: METRICS_ADDR
+              value: ":9090"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_DB
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: S3_SECRET_KEY
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          # /health опрашивает БД, S3 и брокер: 200 — всё в порядке, 503 — часть
+          # зависимостей недоступна. Так под перестаёт принимать трафик, пока
+          # хотя бы одна зависимость не отвечает, вместо того чтобы отдавать
+          # ошибки клиенту.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5

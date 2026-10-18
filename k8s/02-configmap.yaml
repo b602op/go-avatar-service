@@ -1,0 +1,48 @@
+# Несекретная конфигурация server и worker (envFrom: configMapRef).
+#
+# Адреса сервисов — короткие DNS-имена внутри namespace: поды ходят друг к
+# другу по имени Service и внутреннему порту контейнера, как в compose по
+# именам сервисов. Пароли и пользователи здесь не хранятся — они в Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gophprofile-config
+  namespace: gophprofile
+data:
+  # ─── Приложение ───
+  APP_ENV: "local"
+  LOG_LEVEL: "info"
+
+  # ─── OpenTelemetry ───
+  # Jaeger появится в кластере на Шаге 3. Пока его нет, экспортёр OTLP
+  # подключается лениво и падает с warning'ом («traces export: connection
+  # refused»), но приложение не останавливается: сборка спанов best-effort,
+  # а ошибки уходят в лог через otel.SetErrorHandler.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  # К имени добавляется суффикс -server/-worker (см. cmd/*/main.go), поэтому
+  # в Jaeger видны два сервиса с общим префиксом.
+  OTEL_SERVICE_NAME: "gophprofile"
+  OTEL_SERVICE_VERSION: "dev"
+  OTEL_ENVIRONMENT: "local"
+
+  # ─── PostgreSQL ───
+  # postgres — headless Service StatefulSet'а; DNS резолвится в IP единственной
+  # реплики. POSTGRES_USER/PASSWORD/DB приходят из Secret.
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_SSLMODE: "disable"
+
+  # ─── S3 / MinIO ───
+  S3_ENDPOINT: "minio:9000"
+  S3_BUCKET: "avatars"
+  S3_REGION: "us-east-1"
+  S3_USE_SSL: "false"
+
+  # ─── RabbitMQ ───
+  # URL содержит учётные данные: при смене RABBITMQ_DEFAULT_USER/PASS в Secret
+  # это значение нужно поправить синхронно.
+  RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+  RABBITMQ_EXCHANGE: "avatars.exchange"
+  # Go-формат duration: config.Load() парсит значение через time.ParseDuration,
+  # и «30000» уронило бы старт с ошибкой "must be a valid duration".
+  RABBITMQ_RETRY_TTL: "30s"

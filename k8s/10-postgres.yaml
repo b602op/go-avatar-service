@@ -1,0 +1,83 @@
+# PostgreSQL: StatefulSet с локальным PVC.
+#
+# StatefulSet, а не Deployment: у БД есть состояние, и она должна сохранять
+# привязку «под ↔ том» между перезапусками. volumeClaimTemplates создаёт PVC
+# на каждую реплику (postgres-data-0) из StorageClass по умолчанию (standard).
+#
+# Service headless (clusterIP: None) — обязательное условие для StatefulSet:
+# он даёт стабильное DNS-имя postgres.<ns>.svc, по которому приложение
+# подключается к единственной реплике.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: gophprofile
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None # headless для StatefulSet
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: gophprofile
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB: официальный образ
+          # создаёт пользователя и базу при первой инициализации тома.
+          envFrom:
+            - secretRef:
+                name: gophprofile-secrets
+          env:
+            # Данные в подкаталоге pgdata, а не в корне тома: на томе может
+            # лежать lost+found, из-за которого initdb отказывается работать.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # pg_isready — штатный способ проверки готовности: он проверяет, что
+          # сервер принимает соединения, а не просто что процесс запущен.
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "avatar", "-d", "avatars"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "avatar", "-d", "avatars"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
