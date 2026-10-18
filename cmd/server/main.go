@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"github.com/b602op/avatars-service/internal/api"
@@ -43,6 +44,12 @@ const (
 	// writeTimeout — верхняя граница времени записи ответа. С запасом больше
 	// таймаута middleware (30s), чтобы большие файлы успели дойти до клиента.
 	writeTimeout = 60 * time.Second
+
+	// migrateOnlyEnv — переменная окружения, включающая режим одноразового
+	// применения миграций. Используется Helm-хуком (Job gophprofile-migrate в
+	// helm/gophprofile/templates/70-migration-job.yaml): тот запускает этот же
+	// образ с MIGRATE_ONLY=true и ждёт успешного завершения.
+	migrateOnlyEnv = "MIGRATE_ONLY"
 )
 
 func main() {
@@ -78,6 +85,13 @@ func run() (err error) {
 		syscall.SIGTERM,
 	)
 	defer stopSignals()
+
+	// Режим миграций проверяется до телеметрии и сервера метрик: в этом режиме
+	// процесс нужен только чтобы применить схему и завершиться, поэтому
+	// трейсинг, /metrics и HTTP-сервер не поднимаются вообще.
+	if os.Getenv(migrateOnlyEnv) == "true" {
+		return migrateOnly(signalCtx, cfg, log)
+	}
 
 	// Трейсинг: OTLP HTTP → Jaeger. Недоступность коллектора не фатальна:
 	// соединение устанавливается лениво, а ошибки экспорта уходят в наш slog
@@ -156,10 +170,7 @@ func run() (err error) {
 
 	// Миграции применяются при старте
 	// повторный запуск и параллельный старт server/worker безопасны.
-	migCtx, cancelMig := context.WithTimeout(signalCtx, migrationTimeout)
-	err = migrator.Up(migCtx, pool, log)
-	cancelMig()
-	if err != nil {
+	if err := applyMigrations(signalCtx, pool, log); err != nil {
 		return fmt.Errorf("failed to apply migrations: %w", err)
 	}
 
@@ -218,6 +229,44 @@ func run() (err error) {
 	}
 
 	return serveHTTP(signalCtx, srv, log)
+}
+
+// migrateOnly применяет миграции и завершается, не поднимая HTTP-сервер,
+// сервер метрик и трейсинг. Нужен Helm-хуку: Job gophprofile-migrate запускает
+// образ server с MIGRATE_ONLY=true и считает деплой успешным только если схема
+// применена. Пула хватает одного соединения, поэтому отдельный «лёгкий» путь
+// к БД не нужен — используется тот же postgres.NewPool.
+func migrateOnly(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
+	log.Info("MIGRATE_ONLY is set: applying migrations and exiting")
+
+	// Пул создаётся с таймаутом инициализации (подключение + ping), а сами
+	// миграции получают собственный бюджет — см. applyMigrations.
+	initCtx, cancelInit := context.WithTimeout(context.Background(), initTimeout)
+	defer cancelInit()
+
+	pool, err := postgres.NewPool(initCtx, cfg.Postgres.DSN())
+	if err != nil {
+		return fmt.Errorf("migrate only: connect to postgres: %w", err)
+	}
+	defer pool.Close()
+
+	if err := applyMigrations(ctx, pool, log); err != nil {
+		return fmt.Errorf("migrate only: %w", err)
+	}
+
+	log.Info("migrations applied, exiting (MIGRATE_ONLY)")
+
+	return nil
+}
+
+// applyMigrations применяет миграции с отдельным бюджетом времени: подключение
+// к БД укладывается в секунды, а миграции могут создавать индексы и выполняться
+// заметно дольше, поэтому initTimeout для них не подходит.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) error {
+	migCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
+	defer cancel()
+
+	return migrator.Up(migCtx, pool, log)
 }
 
 func serveHTTP(

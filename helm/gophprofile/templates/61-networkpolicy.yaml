@@ -1,0 +1,275 @@
+{{/*
+Сетевая сегментация: каждому компоненту разрешено ровно то, что он реально
+использует. Логика — default deny + явные разрешения: как только у пода
+появляется хотя бы одна политика с policyTypes: Ingress, весь входящий трафик,
+не описанный в правилах, отбрасывается (то же для Egress).
+
+Уровни доступа:
+  * server   — снаружи только от ingress-контроллера, наружу только к своим
+               зависимостям и DNS;
+  * worker   — снаружи только порт метрик, наружу только к зависимостям и DNS;
+  * postgres / minio / rabbitmq — снаружи только от server и worker.
+
+Чего в политиках НЕТ осознанно:
+  * правила «DNS наружу»: приложению нужен только кластерный резолвер
+    (kube-system:53), внешние DNS ему не нужны — значит, и разрешать их незачем;
+  * ingress для server на порт метрик 9090: в проде его скрейпит Prometheus из
+    namespace monitoring, и туда добавляется второе правило `from:
+    namespaceSelector monitoring`. В локальном стенде оператора нет, поэтому
+    правила нет — вместе с serviceMonitor.enabled=false это согласовано;
+  * egress у БД и брокера: их политика задаёт только Ingress, поэтому исходящий
+    трафик не ограничен. Ответы на входящие соединения идут по уже
+    установленным соединениям и egress-правил не требуют.
+
+Проверено на локальном стенде (CNI kindnet, minikube v1.39): политики реально
+фильтруют трафик — под из другого namespace не достучался до server:8080, под
+без меток app не достучался до postgres/minio/rabbitmq, а под с меткой
+app=worker — достучался. Протокол проверки — в k8s/61-networkpolicy.yaml.
+*/}}
+---
+# ─── server ─────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: server-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "server") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Пользовательский трафик приходит только через Ingress: контроллер ходит в
+    # поды напрямую по ClusterIP, поэтому источник — поды в namespace
+    # ingress-nginx, а не внешние адреса.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # kubernetes.io/metadata.name Kubernetes проставляет каждому
+              # namespace автоматически, помечать ingress-nginx не требуется.
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - port: 5672
+          protocol: TCP
+    # DNS: CoreDNS живёт в kube-system, порт 53 — и UDP, и TCP (TCP нужен для
+    # ответов, не влезших в UDP). Правило с одним UDP оставило бы редкие
+    # крупные ответы без резолва.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# ─── worker ─────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "worker") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # У воркера нет пользовательского трафика: открыт только порт метрик.
+    # Источник не ограничен (`from` не задан) осознанно: в проде метрики
+    # собирает Prometheus из namespace monitoring, а в локальном стенде его
+    # метки неизвестны. Ограничение по порту сохраняется: ни на что другое
+    # воркер не отвечает.
+    - ports:
+        - port: 9091
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - port: 5672
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# ─── postgres ───────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Оба селектора в одном `from`: правила объединяются по ИЛИ, то есть
+    # допускается и server, и worker. Порт у них общий, поэтому так короче.
+    #
+    # app: migration — под Helm-хука миграций (templates/70-migration-job.yaml).
+    # Без этой строки Job не может подключиться к БД: он не подпадает ни под
+    # server, ни под worker, и его соединения отбрасываются — initContainer
+    # навсегда остаётся в Init:0/1, а install падает по таймауту хука
+    # (проверено). В k8s/ такой метки нет, потому что там нет и Job'а.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+        - podSelector:
+            matchLabels:
+              app: migration
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# ─── minio ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minio-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Только S3 API (9000). Консоль (9001) и метрики брокера (15692) наружу не
+    # открываются: в кластере их никто не использует.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 9000
+          protocol: TCP
+---
+# ─── rabbitmq ───────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 5672
+          protocol: TCP
+---
+# ─── migration (под Helm-хука) ──────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: migration-egress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: migration
+  # Только Egress: к поду миграции никто не подключается, входящий трафик ему
+  # не нужен по определению, а политика на Ingress здесь была бы пустой.
+  policyTypes:
+    - Egress
+  egress:
+    # Под миграции — такой же клиент БД, как server и worker, и получает ровно
+    # те же два разрешения: PostgreSQL и DNS. Без этой политики Job оставался бы
+    # единственным подом namespace без ограничений вообще.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

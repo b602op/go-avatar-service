@@ -1,0 +1,46 @@
+{{- if .Values.hpa.enabled }}
+{{/*
+HPA для HTTP-сервера — единственный компонент, который масштабируется по
+нагрузке: он принимает пользовательский трафик. Воркер разбирает очередь, и его
+ёмкость определяется числом сообщений, а не CPU (отдельная задача).
+
+Утилизация считается как usage / requests, поэтому у контейнера server должны
+быть заданы resources.requests (см. values.yaml) — без них TARGETS показывал бы
+<unknown>.
+
+HPA складывает рекомендации по метрикам и берёт максимум: одного превышения
+достаточно, чтобы добавить поды.
+*/}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: server-hpa
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: server
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    # CPU — основной сигнал: запросы к API упираются в процессор (JSON,
+    # валидация, обращения к БД и S3).
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPU }}
+    # Память как второй сигнал: Go-рантайм держит память долго и отдаёт её ОС
+    # неохотно, поэтому порог высокий — он срабатывает на реальном всплеске, а
+    # не на обычном поведении сборщика мусора.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetMemory }}
+{{- end }}

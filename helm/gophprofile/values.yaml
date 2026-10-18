@@ -1,0 +1,158 @@
+# Значения по умолчанию — локальный кластер (minikube) без Prometheus Operator.
+# Окружения переопределяют их через -f values-dev.yaml / values-prod.yaml.
+#
+# Имена объектов (postgres, minio, rabbitmq, server, worker, gophprofile-secrets,
+# gophprofile-config) в шаблонах зафиксированы, а не собираются из имени релиза:
+# на них ссылаются переменные окружения приложения (POSTGRES_HOST=postgres,
+# S3_ENDPOINT=minio:9000, RABBITMQ_URL=...@rabbitmq:5672) и селекторы
+# NetworkPolicy. Поэтому чарт ставится по одному релизу на namespace.
+
+global:
+  # Namespace объектов. Пусто — используется namespace релиза (-n /
+  # --create-namespace). Значение имеет смысл задавать только если чарт
+  # ставится в общий namespace вместе с другими релизами.
+  namespace: ""
+  # IfNotPresent: образы приложения собираются локально (Dockerfile) и
+  # загружаются в кластер через minikube image load — в реестр за ними ходить
+  # не нужно. Для образов инфраструктуры то же значение убирает лишние
+  # обращения к Docker Hub при каждом старте пода.
+  imagePullPolicy: IfNotPresent
+
+# Переопределяет app.kubernetes.io/name в метках (см. templates/_helpers.tpl).
+nameOverride: ""
+
+server:
+  image:
+    repository: gophprofile-server
+    tag: latest
+  replicas: 2
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+  # HTTP_PORT приложения. Порт Service задаётся отдельно (service.port): снаружи
+  # сервис доступен по 80, приложение слушает 8080.
+  port: 8080
+  # METRICS_ADDR — порт /metrics внутри пода. Номер порта Service `metrics`
+  # (9090) в шаблоне задан явно, как в k8s/20-server.yaml, чтобы не появилось
+  # двух источников истины для одного числа.
+  metricsAddr: ":9090"
+  service:
+    type: ClusterIP
+    port: 80
+
+worker:
+  image:
+    repository: gophprofile-worker
+    tag: latest
+  replicas: 1
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+  # У воркера нет публичного HTTP-сервера: /metrics и /health на отдельном
+  # порту, чтобы не конфликтовать с дефолтным :9090 сервера.
+  metricsAddr: ":9091"
+
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  storage: 1Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+minio:
+  image:
+    repository: pgsty/silo
+    tag: latest
+  storage: 1Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+rabbitmq:
+  image:
+    repository: rabbitmq
+    tag: "3-management-alpine"
+  storage: 1Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+ingress:
+  enabled: true
+  className: nginx
+  host: gophprofile.local
+  annotations:
+    # Приложение отклоняет файлы больше 10 МБ, поэтому и прокси должен
+    # пропускать столько же — иначе клиент получит 413 от nginx.
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPU: 70
+  targetMemory: 80
+
+serviceMonitor:
+  # false по умолчанию: в локальном кластере CRD Prometheus Operator нет.
+  # В проде — включить после установки kube-prometheus-stack.
+  enabled: false
+  interval: 30s
+  # Метка release, по которой Prometheus из kube-prometheus-stack выбирает
+  # ServiceMonitor'ы: по умолчанию это имя helm-релиза стека.
+  releaseLabel: kube-prometheus-stack
+
+migration:
+  # Helm-хук с миграциями (templates/70-migration-job.yaml). Отключается, если
+  # схемой управляет внешний инструмент (например, отдельный pipeline).
+  enabled: true
+  backoffLimit: 3
+
+config:
+  appEnv: local
+  logLevel: info
+  otelEndpoint: "http://jaeger:4318"
+  otelServiceName: gophprofile
+  otelServiceVersion: dev
+  otelEnvironment: local
+  s3Bucket: avatars
+  s3Region: us-east-1
+  s3UseSSL: "false"
+  rabbitmqExchange: avatars.exchange
+  rabbitmqRetryTTL: "30s"
+
+# Учётные данные для учебного стенда: подставляются в Secret и в ConfigMap
+# (RABBITMQ_URL). В проде значения должны приходить из внешнего хранилища
+# секретов, а не из values.yaml — см. docs/tech-debt.md.
+secrets:
+  postgresUser: avatar
+  postgresPassword: avatar
+  postgresDb: avatars
+  minioRootUser: minioadmin
+  minioRootPassword: minioadmin
+  s3AccessKey: minioadmin
+  s3SecretKey: minioadmin
+  rabbitmqUser: guest
+  rabbitmqPassword: guest

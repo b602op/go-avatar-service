@@ -1,0 +1,119 @@
+{{/*
+RabbitMQ: StatefulSet с локальным PVC + headless Service.
+
+Очереди, обменники и привязки — состояние, поэтому StatefulSet: при
+пересоздании пода он возвращается к своему тому, а не теряет очереди.
+
+Порт 15692 (экспортёр метрик) уже поднят образом -management: плагин
+rabbitmq_prometheus включён в нём по умолчанию.
+
+Пробы: check_port_connectivity вместо ping (ping отвечает успехом, как только
+поднялся Erlang-узел, а AMQP-листенер открывается на 3-4 секунды позже) и
+непривычно большие таймауты — один вызов rabbitmq-diagnostics стоит ~7 секунд,
+потому что каждый раз поднимается Erlang CLI. С дефолтным timeoutSeconds: 1
+liveness не проходил никогда, и kubelet убивал брокер по кругу. Разбор — в
+k8s/12-rabbitmq.yaml.
+
+Капабилити: drop ALL + минимум, как у postgres — entrypoint от root делает
+`find /var/lib/rabbitmq ! -user rabbitmq -exec chown rabbitmq` и затем
+`exec su-exec rabbitmq`.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 4 }}
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 4 }}
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672
+    - name: metrics
+      port: 15692
+      targetPort: 15692
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 4 }}
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gophprofile.selectorLabels" (dict "component" "rabbitmq") | nindent 8 }}
+        {{- include "gophprofile.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: gophprofile-db-sa
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: rabbitmq
+          image: "{{ .Values.rabbitmq.image.repository }}:{{ .Values.rabbitmq.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - containerPort: 5672
+            - containerPort: 15672
+            - containerPort: 15692
+          # RABBITMQ_DEFAULT_USER / RABBITMQ_DEFAULT_PASS: брокер создаёт этого
+          # пользователя при первой инициализации тома. Под ним же ходит
+          # приложение (RABBITMQ_URL в ConfigMap собирается из этих значений).
+          envFrom:
+            - secretRef:
+                name: gophprofile-secrets
+          resources:
+            {{- toYaml .Values.rabbitmq.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - SETGID
+                - SETUID
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 15
+            # Брокер стартует ~35 секунд; три подряд неудачи дают запас, чтобы
+            # liveness не мешал старту.
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 15
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.rabbitmq.storage }}

@@ -38,3 +38,7 @@ cover.html
 # OS
 .DS_Store
 Thumbs.db
+
+# Helm: собранные зависимости и упакованные чарты
+helm/gophprofile/charts/
+helm/gophprofile/*.tgz

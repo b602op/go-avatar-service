@@ -30,6 +30,7 @@
 ├── migrations/         # SQL-миграции (goose), встраиваются в бинарник
 ├── docker/             # Docker-файлы и конфигурации
 ├── k8s/                # Манифесты Kubernetes
+├── helm/               # Helm-чарт приложения (упаковка k8s/)
 ├── tests/              # Интеграционные и e2e тесты
 ├── docs/               # Документация проекта
 └── .gitignore          # Файл для исключения файлов из Git
@@ -364,10 +365,106 @@ healthcheck обращается к нему каждые 15 секунд, и Ja
 `messaging.destination.name`, `messaging.rabbitmq.destination.routing_key`,
 `messaging.message.id`.
 
+## Kubernetes — Helm
+
+Чарт `helm/gophprofile` упаковывает тот же стек, что лежит в `k8s/` сырыми
+манифестами (сами манифесты оставлены для сравнения и для отладки без Helm).
+Namespace в чарт не входит — используется `--create-namespace`; ServiceMonitor
+по умолчанию выключен (`serviceMonitor.enabled: false`), потому что в локальном
+кластере нет CRD Prometheus Operator.
+
+```bash
+# Установка: создаёт объекты, затем выполняет хук миграций
+helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace
+
+# Обновление: хук миграций отрабатывает до обновления подов приложения
+helm upgrade gophprofile ./helm/gophprofile -n gophprofile
+
+# Окружения
+helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
+  -f helm/gophprofile/values-dev.yaml     # 1 под сервера, без HPA
+helm upgrade gophprofile ./helm/gophprofile -n gophprofile \
+  -f helm/gophprofile/values-prod.yaml    # 3 пода, HPA до 20, ServiceMonitor, внешний домен
+
+# Удаление (PVC при этом остаются — см. ниже)
+helm uninstall gophprofile -n gophprofile
+
+# Проверка
+helm lint ./helm/gophprofile
+helm template gophprofile ./helm/gophprofile -n gophprofile
+helm list -n gophprofile
+```
+
+### Что в чарте
+
+| Шаблон | Объекты |
+|---|---|
+| `secret.yaml`, `configmap.yaml` | учётные данные и несекретная конфигурация |
+| `10-postgres.yaml`, `11-minio.yaml`, `12-rabbitmq.yaml` | StatefulSet + headless Service + PVC |
+| `20-server.yaml`, `21-worker.yaml` | Deployment + Service |
+| `30-ingress.yaml` | Ingress (гасится `ingress.enabled`) |
+| `40-hpa.yaml` | HPA (гасится `hpa.enabled`) |
+| `50-servicemonitor.yaml` | ServiceMonitor'ы (`serviceMonitor.enabled`, по умолчанию `false`) |
+| `60-serviceaccount.yaml`, `61-networkpolicy.yaml` | ServiceAccount'ы и сетевая сегментация |
+| `70-migration-job.yaml` | Job миграций (Helm-хук) |
+
+Основные ручки — в `values.yaml`: образы и число реплик (`server`, `worker`),
+ресурсы и размеры томов (`postgres`, `minio`, `rabbitmq`), `ingress.*`,
+`hpa.*`, `serviceMonitor.*`, `config.*` и `secrets.*`. Имена объектов
+(`server`, `postgres`, `gophprofile-secrets`, …) зафиксированы, а не собраны из
+имени релиза: на них ссылаются переменные окружения приложения
+(`POSTGRES_HOST=postgres`, `S3_ENDPOINT=minio:9000`) и селекторы NetworkPolicy,
+поэтому чарт рассчитан на один релиз в namespace.
+
+### Хук миграций
+
+`Job gophprofile-migrate` запускает тот же образ, что у сервера, с
+`MIGRATE_ONLY=true`: `cmd/server/main.go` в этом режиме подключается к БД,
+применяет миграции и завершается, не поднимая HTTP-сервер, `/metrics` и трейсинг.
+
+Хук повешен на **`post-install,pre-upgrade`**, а не на `pre-install,pre-upgrade`:
+
+- на первом `install` у `pre-install` хука не существует ни ServiceAccount, ни
+  ConfigMap, ни Secret, ни Service `postgres` — их создаёт сам релиз уже после
+  хуков. Проверено: Job падал с `pods "gophprofile-migrate-" is forbidden:
+  error looking up service account gophprofile/gophprofile-sa: serviceaccount
+  "gophprofile-sa" not found`, а `helm install` завершался ошибкой по таймауту
+  хука (5 минут);
+- `post-install` выполняется после создания объектов релиза, поэтому
+  initContainer Job'а успевает дождаться `postgres:5432`, а `envFrom` — найти
+  ConfigMap и Secret;
+- на `upgrade` порядок остаётся правильным: `pre-upgrade` отрабатывает до
+  обновления подов приложения.
+
+Повторный запуск безопасен: goose пропускает уже применённые миграции (в логе
+upgrade'а нет ни одного `migration applied`). Проверено на живом кластере:
+install — хук `Succeeded` за 14 секунд, upgrade — состав подов и счётчики
+рестартов не изменились.
+
+Под миграции тоже покрыт сетевой политикой (`migration-egress`): ему разрешены
+только PostgreSQL и DNS — как серверу и воркеру. Без этого правила Job не смог
+бы подключиться к БД, потому что `postgres-ingress` пускает лишь поды с
+метками `app: server` / `app: worker`.
+
+### Удаление
+
+`helm uninstall` удаляет все объекты релиза, но **не** PVC: тома
+`data-postgres-0`, `data-minio-0`, `data-rabbitmq-0` остаются, и данные
+переживают переустановку. Если тома больше не нужны:
+
+```bash
+kubectl delete pvc --all -n gophprofile
+```
+
+Чарт проверен на Helm v3.16.4: `helm lint` и `helm template` проходят для
+дефолтных, dev- и prod-значений (22, 21 и 25 объектов соответственно).
+
 ## Kubernetes — мониторинг (ServiceMonitor)
 
 `k8s/50-servicemonitor.yaml` — **артефакт для Prometheus Operator**, в локальном
-кластере он не применяется. Манифест описан в терминах CRD
+кластере он не применяется. В Helm-чарте тот же объект выключен по умолчанию
+(`serviceMonitor.enabled: false`) и включается в проде — см. раздел
+«Kubernetes — Helm». Манифест описан в терминах CRD
 `monitoring.coreos.com/v1`, которых в minikube нет: полный
 `kube-prometheus-stack` требует 2–3 GB RAM, а у ноды 6 GB, из которых ~1.5 GB
 занимают приложение и инфраструктура. Поэтому файл лежит в репозитории как
@@ -383,6 +480,8 @@ helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
 
 # 2. ServiceMonitor'ы для server и worker
 kubectl apply -f k8s/50-servicemonitor.yaml
+# (или через чарт: helm upgrade gophprofile ./helm/gophprofile -n gophprofile \
+#    --set serviceMonitor.enabled=true)
 
 # 3. Проверка: Prometheus → Status → Targets (или)
 kubectl get servicemonitor -n gophprofile
@@ -424,6 +523,9 @@ kubectl apply -f k8s/00-namespace.yaml -f k8s/01-secret.yaml -f k8s/02-configmap
   -f k8s/20-server.yaml -f k8s/21-worker.yaml -f k8s/30-ingress.yaml \
   -f k8s/40-hpa.yaml -f k8s/60-serviceaccount.yaml -f k8s/61-networkpolicy.yaml
 ```
+
+Тот же набор объектов ставится одной командой через Helm — см. раздел
+«Kubernetes — Helm».
 
 ### ServiceAccount
 

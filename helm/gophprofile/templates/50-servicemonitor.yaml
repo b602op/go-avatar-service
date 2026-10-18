@@ -1,0 +1,51 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{/*
+ServiceMonitor'ы для Prometheus Operator (CRD monitoring.coreos.com/v1).
+
+По умолчанию выключены (serviceMonitor.enabled: false): в локальном кластере
+CRD нет — kube-prometheus-stack требует 2-3 GB RAM и не влезает в 6 GB ноды
+minikube вместе с приложением. В проде включается после установки стека:
+  helm upgrade gophprofile ./helm/gophprofile -n gophprofile \
+    --set serviceMonitor.enabled=true
+
+Селектор — метка app: server / app: worker на Service (см. templates/
+20-server.yaml и 21-worker.yaml), а port: metrics — имя порта, а не номер: при
+смене номера порта джоба не развалится.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gophprofile-server
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "server") | nindent 4 }}
+    # Обязательная метка для селектора Prometheus: kube-prometheus-stack по
+    # умолчанию (serviceMonitorSelectorNilUsesHelmValues=true) выбирает только
+    # ServiceMonitor'ы, у которых release совпадает с именем helm-релиза стека.
+    release: {{ .Values.serviceMonitor.releaseLabel }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "server") | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gophprofile-worker
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "worker") | nindent 4 }}
+    release: {{ .Values.serviceMonitor.releaseLabel }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "worker") | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

@@ -1,0 +1,27 @@
+# Окружение production: больше ресурсов, автомасштабирование, ServiceMonitor,
+# внешний домен.
+#   helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
+#     -f helm/gophprofile/values-prod.yaml
+
+server:
+  # Стартовое число подов; дальше им управляет HPA (minReplicas ниже).
+  replicas: 3
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "200m"
+    limits:
+      memory: "512Mi"
+      cpu: "1000m"
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+
+# Включается после установки kube-prometheus-stack (см. README).
+serviceMonitor:
+  enabled: true
+
+ingress:
+  host: avatars.example.com
