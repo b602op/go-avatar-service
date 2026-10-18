@@ -1,0 +1,16 @@
+# Провайдер дашбордов: Grafana читает JSON-файлы из этой же директории при
+# старте и далее перечитывает их каждые 10 секунд (правки без перезапуска).
+
+apiVersion: 1
+
+providers:
+  - name: 'GophProfile'
+    orgId: 1
+    folder: ''
+    type: file
+    # disableDeletion: false — дашборд можно удалить из UI, но он вернётся при
+    # следующем сканировании директории. Для локального стенда это ожидаемо.
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/provisioning/dashboards

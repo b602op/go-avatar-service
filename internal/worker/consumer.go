@@ -8,13 +8,27 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/b602op/avatars-service/internal/amqpx"
 	"github.com/b602op/avatars-service/internal/services/publisher"
 )
 
 // maxRetries — сколько раз transient-ошибка возвращает сообщение в очередь,
 // прежде чем оно уйдёт в DLQ.
 const maxRetries = 3
+
+// tracer — трейсер для спанов обработки сообщений: у amqp091-go нет готовой
+// OTel-инструментации, поэтому спан создаётся вручную. Спан помечается как
+// SpanKindConsumer: это приём сообщения от внешней системы.
+//
+// Переменная инициализируется при загрузке пакета, то есть до telemetry.Init.
+// Это безопасно: до установки SDK глобальный провайдер OTel отдаёт no-op
+// трейсеры и подменяет их на трейсеры SDK в otel.SetTracerProvider.
+var tracer = otel.Tracer("github.com/b602op/avatars-service/worker")
 
 // MessageHandler обрабатывает тело одного сообщения из очереди.
 //
@@ -98,54 +112,82 @@ func (c *Consumer) Run(ctx context.Context) error {
 // лимит повторов → Nack(requeue=false) → DLQ; transient-ошибка → публикация в
 // retry-очередь (TTL) + Ack исходного сообщения.
 func (c *Consumer) handleMessage(ctx context.Context, msg amqp.Delivery) {
-	err := c.handler(ctx, msg.Body)
+	// ctx из Run (signal.NotifyContext) — базовый: он несёт отмену по сигналу.
+	// Extract дополняет его trace context из заголовков сообщения, поэтому спан
+	// обработки становится дочерним к спану публикации на сервере, а не «сиротой».
+	// Если заголовков нет — msgCtx остаётся равным ctx (без trace context).
+	msgCtx := otel.GetTextMapPropagator().Extract(ctx, amqpx.HeaderCarrier(msg.Headers))
+	msgCtx, span := tracer.Start(msgCtx, "RabbitMQ.Consume",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemRabbitMQ,
+			semconv.MessagingDestinationName(c.queue),
+			semconv.MessagingMessageID(msg.MessageId),
+		),
+	)
+	// Ошибку обработки помечаем на спане, но сам спан не заменяет логику
+	// ack/nack: сообщение может быть успешно переотправлено в retry-очередь,
+	// и это всё равно ошибка обработки.
+	defer span.End()
+
+	err := c.handler(msgCtx, msg.Body)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+
 	if err == nil {
 		if ackErr := msg.Ack(false); ackErr != nil {
-			c.log.Error("failed to ack message", "queue", c.queue, "error", ackErr)
+			c.log.ErrorContext(msgCtx, "failed to ack message", "queue", c.queue, "error", ackErr)
 		}
 		return
 	}
 
 	var permErr *publisher.PermanentError
 	if errors.As(err, &permErr) {
-		c.log.Error("permanent error, sending to DLQ",
+		c.log.ErrorContext(msgCtx, "permanent error, sending to DLQ",
 			"queue", c.queue, "error", err, "message_id", msg.MessageId)
-		c.nackToDLQ(msg)
+		c.nackToDLQ(msgCtx, msg)
 		return
 	}
 
 	retryCount := countRetries(msg.Headers)
 	if retryCount >= maxRetries {
-		c.log.Error("max retries exceeded, sending to DLQ",
+		c.log.ErrorContext(msgCtx, "max retries exceeded, sending to DLQ",
 			"queue", c.queue, "error", err, "retry_count", retryCount, "message_id", msg.MessageId)
-		c.nackToDLQ(msg)
+		c.nackToDLQ(msgCtx, msg)
 		return
 	}
 
 	// Transient-ошибка: откладываем через retry-очередь с TTL.
-	c.log.Warn("transient error, sending to retry queue",
+	c.log.WarnContext(msgCtx, "transient error, sending to retry queue",
 		"queue", c.queue, "error", err, "retry_count", retryCount, "message_id", msg.MessageId)
 
-	if pubErr := c.publishToRetry(ctx, msg); pubErr != nil {
+	// msgCtx, а не ctx: в нём есть trace context из заголовков, поэтому трейс
+	// не обрывается на повторной публикации.
+	if pubErr := c.publishToRetry(msgCtx, msg); pubErr != nil {
 		// Retry-публикация не удалась — оставляем сообщение в очереди (worst case).
-		c.log.Error("failed to publish to retry queue, requeueing",
+		c.log.ErrorContext(msgCtx, "failed to publish to retry queue, requeueing",
 			"queue", c.queue, "error", pubErr, "message_id", msg.MessageId)
 		if nackErr := msg.Nack(false, true); nackErr != nil {
-			c.log.Error("failed to nack message", "queue", c.queue, "error", nackErr)
+			c.log.ErrorContext(msgCtx, "failed to nack message", "queue", c.queue, "error", nackErr)
 		}
 		return
 	}
 
 	// Исходное сообщение подтверждаем: за отложенный повтор отвечает retry-очередь.
 	if ackErr := msg.Ack(false); ackErr != nil {
-		c.log.Error("failed to ack message", "queue", c.queue, "error", ackErr)
+		c.log.ErrorContext(msgCtx, "failed to ack message", "queue", c.queue, "error", ackErr)
 	}
 }
 
 // nackToDLQ отклоняет сообщение без возврата в очередь: сработает dead-lettering.
-func (c *Consumer) nackToDLQ(msg amqp.Delivery) {
+//
+// ctx — msgCtx из handleMessage: в нём есть trace context из заголовков, поэтому
+// запись о неудачном nack попадает в тот же трейс, что и обработка сообщения.
+func (c *Consumer) nackToDLQ(ctx context.Context, msg amqp.Delivery) {
 	if nackErr := msg.Nack(false, false); nackErr != nil {
-		c.log.Error("failed to nack message", "queue", c.queue, "error", nackErr)
+		c.log.ErrorContext(ctx, "failed to nack message", "queue", c.queue, "error", nackErr)
 	}
 }
 
@@ -153,15 +195,29 @@ func (c *Consumer) nackToDLQ(msg amqp.Delivery) {
 //
 // Заголовки (включая x-death) копируются, чтобы счётчик повторов не терялся:
 // именно dead-lettering из retry-очереди инкрементит x-death.count.
+//
+// ctx — msgCtx из handleMessage: в нём уже есть trace context из заголовков,
+// поэтому при повторной доставке воркер продолжит тот же трейс. Если передать
+// базовый ctx из Run, трейс оборвётся на первом же retry.
 func (c *Consumer) publishToRetry(ctx context.Context, msg amqp.Delivery) error {
 	pub := amqp.Publishing{
 		ContentType:  msg.ContentType,
 		DeliveryMode: amqp.Persistent,
 		MessageId:    msg.MessageId,
 		Timestamp:    time.Now(),
-		Headers:      msg.Headers,
-		Body:         msg.Body,
+		// Ссылка на тот же amqp.Table, что пришёл от брокера: x-death и прочие
+		// служебные заголовки должны дойти до retry-очереди без потерь.
+		Headers: msg.Headers,
+		Body:    msg.Body,
 	}
+
+	// При первом цикле повтора Headers может быть nil (сообщение без заголовков):
+	// Inject пишет в карту и на nil-карте паникует. Инжект перезапишет только
+	// traceparent/tracestate, x-death остаётся нетронутым.
+	if pub.Headers == nil {
+		pub.Headers = amqp.Table{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, amqpx.HeaderCarrier(pub.Headers))
 
 	if err := c.channel.PublishWithContext(ctx, c.retryExchange, c.retryRoutingKey, false, false, pub); err != nil {
 		return fmt.Errorf("worker: publish to retry: %w", err)

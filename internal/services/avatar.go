@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/metrics"
 )
 
 // sizeOriginal — значение параметра size, означающее выдачу оригинала.
@@ -64,18 +65,31 @@ func NewAvatarService(
 //
 // Ошибка repo.Create компенсируется удалением уже загруженного оригинала,
 // иначе файл остался бы в S3 навсегда (orphan).
+//
+// Возвращаемые значения именованы ради defer: он записывает метрики загрузки
+// с меткой исхода, а исход известен только в момент выхода из функции.
 func (s *AvatarService) Upload(
 	ctx context.Context,
 	userID, fileName, contentType string,
 	data []byte,
-) (*domain.Avatar, error) {
+) (avatar *domain.Avatar, err error) {
+	start := time.Now()
+	defer func() {
+		status := metrics.StatusSuccess
+		if err != nil {
+			status = metrics.StatusError
+		}
+		metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
+		metrics.AvatarsUploadDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+	}()
+
 	if err := ValidateImage(data, contentType); err != nil {
 		return nil, err
 	}
 
 	avatarID := uuid.New()
 	s3Key := OriginalKey(userID, avatarID, fileName)
-	s.log.Debug("avatar upload prepared",
+	s.log.DebugContext(ctx, "avatar upload prepared",
 		"avatar_id", avatarID,
 		"user_id", userID,
 		"key", s3Key,
@@ -88,7 +102,7 @@ func (s *AvatarService) Upload(
 	}
 
 	now := time.Now().UTC()
-	avatar := &domain.Avatar{
+	avatar = &domain.Avatar{
 		ID:               avatarID,
 		UserID:           userID,
 		FileName:         fileName,
@@ -107,7 +121,7 @@ func (s *AvatarService) Upload(
 		// файл остаётся навсегда: логируем громко (техдолг — нужен
 		// отдельный sweeper для осиротевших объектов).
 		if delErr := s.storage.Delete(ctx, s3Key); delErr != nil {
-			s.log.Error("upload compensation failed: orphan in object storage",
+			s.log.ErrorContext(ctx, "upload compensation failed: orphan in object storage",
 				"avatar_id", avatarID,
 				"s3_key", s3Key,
 				"delete_err", delErr,
@@ -119,13 +133,17 @@ func (s *AvatarService) Upload(
 	if err := s.publisher.PublishAvatarUploaded(ctx, avatarID, userID, s3Key); err != nil {
 		// Best-effort: запись создана, клиент получает 201. Событие
 		// переопубликует cleanup-воркер, увидев pending-аватар.
-		s.log.Warn("avatar created but upload event was not published",
+		s.log.WarnContext(ctx, "avatar created but upload event was not published",
 			"avatar_id", avatarID,
 			"err", err,
 		)
 	}
 
-	s.log.Info("avatar uploaded", "avatar_id", avatarID, "user_id", userID)
+	// Размер наблюдается только у принятого файла: отказы валидации — это про
+	// avatars_uploads_total{status="error"}, а не про распределение размеров.
+	metrics.AvatarsFileSize.Observe(float64(len(data)))
+
+	s.log.InfoContext(ctx, "avatar uploaded", "avatar_id", avatarID, "user_id", userID)
 	return avatar, nil
 }
 
@@ -160,8 +178,8 @@ func (s *AvatarService) GetContent(
 		return nil, nil, err
 	}
 
-	s.log.Info("content requested", "avatar_id", id, "size", size)
-	s.log.Debug("downloading content", "avatar_id", id, "key", key)
+	s.log.InfoContext(ctx, "content requested", "avatar_id", id, "size", size)
+	s.log.DebugContext(ctx, "downloading content", "avatar_id", id, "key", key)
 
 	rc, info, err := s.storage.Download(ctx, key)
 	if err != nil {
@@ -213,7 +231,18 @@ func contentTypeFor(avatar *domain.Avatar, size string) string {
 // Очистка объектов в S3 выполняется асинхронно воркером по событию
 // avatar.deleted: если S3 недоступен, consumer переотправит сообщение (retry).
 // Поэтому сам метод не трогает storage — только БД и брокер.
-func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID string) error {
+//
+// Именованный err нужен defer'у с метрикой исхода: отказ по правам, отсутствие
+// записи и сбой публикации считаются ошибкой, успешное удаление — успехом.
+func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID string) (err error) {
+	defer func() {
+		status := metrics.StatusSuccess
+		if err != nil {
+			status = metrics.StatusError
+		}
+		metrics.AvatarsDeletesTotal.WithLabelValues(status).Inc()
+	}()
+
 	avatar, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -232,7 +261,7 @@ func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID st
 		return fmt.Errorf("services: publish avatar deleted: %w", err)
 	}
 
-	s.log.Info("avatar deleted", "avatar_id", id, "user_id", requesterID)
+	s.log.InfoContext(ctx, "avatar deleted", "avatar_id", id, "user_id", requesterID)
 	return nil
 }
 

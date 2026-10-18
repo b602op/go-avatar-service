@@ -67,18 +67,18 @@ func (c *Cleanup) Run(ctx context.Context) {
 func (c *Cleanup) runOnce(ctx context.Context) {
 	avatars, err := c.repo.ListPending(ctx, c.threshold)
 	if err != nil {
-		c.log.Error("cleanup: list pending failed", "error", err)
+		c.log.ErrorContext(ctx, "cleanup: list pending failed", "error", err)
 		return
 	}
 	if len(avatars) == 0 {
 		return
 	}
 
-	c.log.Info("cleanup: found pending", "count", len(avatars))
+	c.log.InfoContext(ctx, "cleanup: found pending", "count", len(avatars))
 	for _, a := range avatars {
 		c.republish(ctx, a)
 	}
-	c.log.Info("cleanup: done")
+	c.log.InfoContext(ctx, "cleanup: done")
 }
 
 // republish помечает запись processing и перепубликует событие загрузки.
@@ -91,17 +91,17 @@ func (c *Cleanup) runOnce(ctx context.Context) {
 // на следующем круге.
 func (c *Cleanup) republish(ctx context.Context, a *domain.Avatar) {
 	if err := c.repo.UpdateProcessingStatus(ctx, a.ID, domain.ProcessingStatusProcessing, nil); err != nil {
-		c.log.Error("cleanup: mark processing failed", "avatar_id", a.ID, "error", err)
+		c.log.ErrorContext(ctx, "cleanup: mark processing failed", "avatar_id", a.ID, "error", err)
 		return
 	}
 
 	if err := c.publisher.PublishAvatarUploaded(ctx, a.ID, a.UserID, a.S3Key); err != nil {
-		c.log.Error("cleanup: republish failed", "avatar_id", a.ID, "error", err)
+		c.log.ErrorContext(ctx, "cleanup: republish failed", "avatar_id", a.ID, "error", err)
 		if rbErr := c.repo.UpdateProcessingStatus(ctx, a.ID, domain.ProcessingStatusPending, nil); rbErr != nil {
-			c.log.Error("cleanup: rollback to pending failed", "avatar_id", a.ID, "error", rbErr)
+			c.log.ErrorContext(ctx, "cleanup: rollback to pending failed", "avatar_id", a.ID, "error", rbErr)
 		}
 		return
 	}
 
-	c.log.Info("cleanup: republished", "avatar_id", a.ID)
+	c.log.InfoContext(ctx, "cleanup: republished", "avatar_id", a.ID)
 }

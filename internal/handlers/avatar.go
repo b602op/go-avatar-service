@@ -14,6 +14,7 @@ import (
 
 	"github.com/b602op/avatars-service/internal/domain"
 	"github.com/b602op/avatars-service/internal/httpx"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/services"
 )
 
@@ -62,9 +63,11 @@ func NewAvatarHandler(svc AvatarService, log *slog.Logger) *AvatarHandler {
 
 // Upload обрабатывает POST /api/v1/avatars (multipart/form-data, поле "image").
 func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
-	userID, ok := httpx.UserIDFromContext(r.Context())
+	ctx := r.Context()
+
+	userID, ok := httpx.UserIDFromContext(ctx)
 	if !ok || userID == "" {
-		h.log.Warn("user id missing in context")
+		h.log.WarnContext(ctx, "user id missing in context")
 		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "Unauthorized"})
 		return
 	}
@@ -80,7 +83,7 @@ func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		h.log.Warn("invalid multipart form", "error", err)
+		h.log.WarnContext(ctx, "invalid multipart form", "error", err)
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid multipart form"})
 		return
 	}
@@ -88,7 +91,7 @@ func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// Поле называется "image" — контракт фронтенда (web/static/index.html).
 	file, header, err := r.FormFile("image")
 	if err != nil {
-		h.log.Warn("missing file field", "error", err)
+		h.log.WarnContext(ctx, "missing file field", "error", err)
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "Missing file",
 			Details: "Field 'image' is required",
@@ -99,7 +102,7 @@ func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		respondError(w, h.log, fmt.Errorf("handlers: read uploaded file: %w", err))
+		respondError(ctx, w, h.log, fmt.Errorf("handlers: read uploaded file: %w", err))
 		return
 	}
 	if int64(len(data)) > services.MaxFileSize {
@@ -118,13 +121,20 @@ func (h *AvatarHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		contentType = http.DetectContentType(data)
 	}
 
-	avatar, err := h.svc.Upload(r.Context(), userID, header.Filename, contentType, data)
+	avatar, err := h.svc.Upload(ctx, userID, header.Filename, contentType, data)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(ctx, w, h.log, err)
 		return
 	}
 
-	h.log.Info("avatar uploaded", "avatar_id", avatar.ID, "user_id", userID)
+	// size_class — категория размера для человекочитаемых выборок в логах;
+	// в метрики она не идёт (там бакеты гистограммы avatars_file_size_bytes).
+	h.log.InfoContext(ctx, "avatar uploaded",
+		"avatar_id", avatar.ID,
+		"user_id", userID,
+		"size_bytes", len(data),
+		"size_class", metrics.SizeClass(int64(len(data))),
+	)
 	respondJSON(w, http.StatusCreated, UploadResponse{
 		ID:        avatar.ID.String(),
 		UserID:    avatar.UserID,
@@ -143,11 +153,11 @@ func (h *AvatarHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 
 	avatar, err := h.svc.GetByID(r.Context(), id)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(r.Context(), w, h.log, err)
 		return
 	}
 
-	h.log.Info("avatar fetched", "avatar_id", id)
+	h.log.InfoContext(r.Context(), "avatar fetched", "avatar_id", id)
 	respondJSON(w, http.StatusOK, avatarToResponse(avatar))
 }
 
@@ -155,29 +165,31 @@ func (h *AvatarHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 //
 // Отдаёт самый свежий аватар пользователя (репозиторий сортирует по created_at DESC).
 func (h *AvatarHandler) GetUserAvatar(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	userID := chi.URLParam(r, "user_id")
 
-	avatars, err := h.svc.ListByUserID(r.Context(), userID)
+	avatars, err := h.svc.ListByUserID(ctx, userID)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(ctx, w, h.log, err)
 		return
 	}
 	if len(avatars) == 0 {
-		respondError(w, h.log, domain.ErrNotFound)
+		respondError(ctx, w, h.log, domain.ErrNotFound)
 		return
 	}
 
-	h.log.Info("user avatar fetched", "user_id", userID, "avatar_id", avatars[0].ID)
+	h.log.InfoContext(ctx, "user avatar fetched", "user_id", userID, "avatar_id", avatars[0].ID)
 	respondJSON(w, http.StatusOK, avatarToResponse(avatars[0]))
 }
 
 // ListByUser обрабатывает GET /api/v1/users/{user_id}/avatars.
 func (h *AvatarHandler) ListByUser(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	userID := chi.URLParam(r, "user_id")
 
-	avatars, err := h.svc.ListByUserID(r.Context(), userID)
+	avatars, err := h.svc.ListByUserID(ctx, userID)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(ctx, w, h.log, err)
 		return
 	}
 
@@ -186,7 +198,7 @@ func (h *AvatarHandler) ListByUser(w http.ResponseWriter, r *http.Request) {
 		resp = append(resp, avatarToResponse(a))
 	}
 
-	h.log.Info("avatars listed", "user_id", userID, "count", len(resp))
+	h.log.InfoContext(ctx, "avatars listed", "user_id", userID, "count", len(resp))
 	respondJSON(w, http.StatusOK, resp)
 }
 
@@ -199,11 +211,11 @@ func (h *AvatarHandler) Metadata(w http.ResponseWriter, r *http.Request) {
 
 	avatar, err := h.svc.GetByID(r.Context(), id)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(r.Context(), w, h.log, err)
 		return
 	}
 
-	h.log.Info("avatar metadata fetched", "avatar_id", id)
+	h.log.InfoContext(r.Context(), "avatar metadata fetched", "avatar_id", id)
 	respondJSON(w, http.StatusOK, avatarToMetadata(avatar))
 }
 
@@ -213,6 +225,8 @@ func (h *AvatarHandler) Metadata(w http.ResponseWriter, r *http.Request) {
 // миниатюру (size=100x100, size=300x300). Ресайза на лету нет — неизвестный
 // размер даёт 501 (domain.ErrNotImplemented).
 func (h *AvatarHandler) GetContent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	id, ok := h.parseAvatarID(w, r)
 	if !ok {
 		return
@@ -223,14 +237,14 @@ func (h *AvatarHandler) GetContent(w http.ResponseWriter, r *http.Request) {
 		size = sizeOriginal
 	}
 
-	reader, info, err := h.svc.GetContent(r.Context(), id, size)
+	reader, info, err := h.svc.GetContent(ctx, id, size)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(ctx, w, h.log, err)
 		return
 	}
 	defer func() { _ = reader.Close() }()
 
-	h.log.Info("avatar content served", "avatar_id", id, "size", size, "bytes", info.Size)
+	h.log.InfoContext(ctx, "avatar content served", "avatar_id", id, "size", size, "bytes", info.Size)
 
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
@@ -243,7 +257,7 @@ func (h *AvatarHandler) GetContent(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, reader); err != nil {
 		// Ответ уже начал уходить: клиент мог отключиться или получить обрыв.
 		// Это не 5xx приложения — фиксируем в логе и завершаем обработку.
-		h.log.Warn("avatar content copy failed", "avatar_id", id, "size", size, "error", err)
+		h.log.WarnContext(ctx, "avatar content copy failed", "avatar_id", id, "size", size, "error", err)
 	}
 }
 
@@ -260,15 +274,16 @@ func (h *AvatarHandler) Delete(w http.ResponseWriter, r *http.Request) {
 //
 // Удаляет самый свежий аватар пользователя.
 func (h *AvatarHandler) DeleteUserAvatar(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	userID := chi.URLParam(r, "user_id")
 
-	avatars, err := h.svc.ListByUserID(r.Context(), userID)
+	avatars, err := h.svc.ListByUserID(ctx, userID)
 	if err != nil {
-		respondError(w, h.log, err)
+		respondError(ctx, w, h.log, err)
 		return
 	}
 	if len(avatars) == 0 {
-		respondError(w, h.log, domain.ErrNotFound)
+		respondError(ctx, w, h.log, domain.ErrNotFound)
 		return
 	}
 
@@ -277,28 +292,31 @@ func (h *AvatarHandler) DeleteUserAvatar(w http.ResponseWriter, r *http.Request)
 
 // deleteAvatar — общая логика удаления: проверка владельца и ответ 204.
 func (h *AvatarHandler) deleteAvatar(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
-	requesterID, ok := httpx.UserIDFromContext(r.Context())
+	ctx := r.Context()
+
+	requesterID, ok := httpx.UserIDFromContext(ctx)
 	if !ok || requesterID == "" {
-		h.log.Warn("user id missing in context")
+		h.log.WarnContext(ctx, "user id missing in context")
 		respondJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "Unauthorized"})
 		return
 	}
 
-	if err := h.svc.Delete(r.Context(), id, requesterID); err != nil {
-		respondError(w, h.log, err)
+	if err := h.svc.Delete(ctx, id, requesterID); err != nil {
+		respondError(ctx, w, h.log, err)
 		return
 	}
 
-	h.log.Info("avatar deleted", "avatar_id", id, "user_id", requesterID)
+	h.log.InfoContext(ctx, "avatar deleted", "avatar_id", id, "user_id", requesterID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // parseAvatarID читает и парсит path-параметр avatar_id.
 // При невалидном UUID отвечает 400 и возвращает ok=false.
 func (h *AvatarHandler) parseAvatarID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
-	id, err := uuid.Parse(chi.URLParam(r, "avatar_id"))
+	raw := chi.URLParam(r, "avatar_id")
+	id, err := uuid.Parse(raw)
 	if err != nil {
-		h.log.Warn("invalid avatar id", "raw", chi.URLParam(r, "avatar_id"), "error", err)
+		h.log.WarnContext(r.Context(), "invalid avatar id", "raw", raw, "error", err)
 		respondJSON(w, http.StatusBadRequest, ErrorResponse{Error: "Invalid avatar ID"})
 		return uuid.Nil, false
 	}

@@ -69,6 +69,10 @@ services:
     ports:
       - "5672:5672"    # AMQP
       - "15672:15672"  # Management UI
+      # Prometheus exporter. Плагин rabbitmq_prometheus уже включён в образе
+      # (-management tag), отдельной установки не требует. Наружу публикуется
+      # только для отладки: Prometheus скрейпит rabbitmq:15692 изнутри сети.
+      - "15692:15692"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -107,6 +111,9 @@ services:
       APP_ENV: local
       LOG_LEVEL: info
       HTTP_PORT: 8080
+      # Порт метрик сервера. Задан явно, хотя совпадает с дефолтом в коде:
+      # так адрес виден в одном месте — рядом с пробросом портов ниже.
+      METRICS_ADDR: :9090
       # Внутри docker-сети — имя сервиса и внутренний порт (5432, не хостовый).
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -122,8 +129,19 @@ services:
       S3_USE_SSL: "false"
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RABBITMQ_EXCHANGE: avatars.exchange
+      # ─── Observability ───
+      # Внутри docker-сети коллектор — это jaeger:4318 (OTLP HTTP).
+      # Значение из .env.example (localhost:4318) здесь не годится: для
+      # контейнера localhost — он сам.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: gophprofile
+      OTEL_SERVICE_VERSION: dev
+      OTEL_ENVIRONMENT: local
     ports:
       - "8080:8080"
+      # Порт метрик публикуется только для локальной отладки (curl/Prometheus
+      # на хосте). В проде /metrics остаётся внутренним.
+      - "9090:9090"
     healthcheck:
       # Тот же /health, что отдаёт приложение: 503 (degraded/down) считается
       # неуспехом, поэтому статус контейнера отражает состояние зависимостей.
@@ -155,6 +173,10 @@ services:
     environment:
       APP_ENV: local
       LOG_LEVEL: info
+      # У воркера нет публичного HTTP-сервера, поэтому метрики и /health живут
+      # на отдельном порту. Явно задаём :9091 — дефолт в коде (:9090) занят
+      # сервером, и без этой переменной метрики обоих процессов конфликтовали бы.
+      METRICS_ADDR: :9091
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-avatar}
@@ -173,6 +195,125 @@ services:
       # значение через time.ParseDuration, и «30000» приводит к падению старта
       # с ошибкой "must be a valid duration".
       RABBITMQ_RETRY_TTL: 30s
+      # ─── Observability ───
+      # Имя сервиса то же, что у server: суффикс -worker добавляет main.go,
+      # поэтому в Jaeger видны два разных сервиса (gophprofile-server/-worker),
+      # а общий префикс позволяет фильтровать их одной выборкой.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: gophprofile
+      OTEL_SERVICE_VERSION: dev
+      OTEL_ENVIRONMENT: local
+    ports:
+      - "9091:9091"
+    healthcheck:
+      # Воркерский /health — это liveness, а не проверка зависимостей: он лишь
+      # подтверждает, что процесс жив и обслуживает вспомогательный HTTP-сервер.
+      # Подключения к БД/S3/RabbitMQ проверяются на старте, при инициализации.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9091/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - gophprofile
+
+  # ─── Observability ─────────────────────────────────────────────────────────
+  # Стек «трейсы + метрики + логи» на одном docker-хосте: всё локальное,
+  # поэтому образы с фиксированными тегами (воспроизводимость важнее свежести).
+  #
+  #   приложение → OTLP → jaeger          (трейсы)
+  #   приложение → /metrics ← prometheus  (метрики)
+  #   docker logs → promtail → loki       (логи)
+  #   grafana ← prometheus + loki + jaeger (единая точка входа)
+
+  # Jaeger all-in-one: коллектор OTLP + хранилище в памяти + UI.
+  # Данные живут только в памяти процесса — для локальной отладки этого
+  # достаточно, а volume для них не нужен.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: gophprofile-jaeger
+    restart: unless-stopped
+    environment:
+      # Без этого флага Jaeger не поднимает OTLP-приёмник на 4318.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP HTTP (server/worker шлют спаны сюда)
+    networks:
+      - gophprofile
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: gophprofile-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      # Разрешает POST /-/reload: правки конфига применяются без перезапуска.
+      - "--web.enable-lifecycle"
+    ports:
+      # 9090 на хосте занят метриками server'а, поэтому наружу — 9092.
+      - "9092:9090"
+    depends_on:
+      server:
+        condition: service_started
+      worker:
+        condition: service_started
+    networks:
+      - gophprofile
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: gophprofile-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Анонимный вход только на чтение: дашборды открываются без логина,
+      # но редактировать/удалять их нельзя.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - gophprofile
+
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: gophprofile-loki
+    restart: unless-stopped
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    networks:
+      - gophprofile
+
+  # Promtail читает логи контейнеров напрямую из docker-сокета (не с диска),
+  # поэтому портов у него нет — наружу он не отдаёт ничего.
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: gophprofile-promtail
+    restart: unless-stopped
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/promtail-config.yml
+    depends_on:
+      - loki
     networks:
       - gophprofile
 
@@ -183,6 +324,12 @@ volumes:
     name: gophprofile-minio-data
   rabbitmq_data:
     name: gophprofile-rabbitmq-data
+  prometheus_data:
+    name: gophprofile-prometheus-data
+  grafana_data:
+    name: gophprofile-grafana-data
+  loki_data:
+    name: gophprofile-loki-data
 
 networks:
   gophprofile:

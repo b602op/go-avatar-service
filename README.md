@@ -56,7 +56,7 @@
 
 5.  **Запустите сервисы с помощью Docker Compose:**
     ```bash
-    docker-compose up --build
+    docker compose -f docker/docker-compose.yml --env-file .env up -d --build --wait
     ```
 
 После этого сервис будет доступен по адресу `http://localhost:8080`.
@@ -97,9 +97,14 @@ flowchart LR
 |---|---|---|---|
 | `postgres` | `gophprofile-postgres` | 5432 | база данных |
 | `minio` | `gophprofile-minio` | 9000, 9001 | S3-хранилище (9001 — консоль) |
-| `rabbitmq` | `gophprofile-rabbitmq` | 5672, 15672 | брокер (15672 — management UI) |
-| `server` | `gophprofile-server` | 8080 | HTTP API |
-| `worker` | `gophprofile-worker` | — | обработка событий (миниатюры, удаление) |
+| `rabbitmq` | `gophprofile-rabbitmq` | 5672, 15672, 15692 | брокер (15672 — management UI, 15692 — метрики) |
+| `server` | `gophprofile-server` | 8080, 9090 | HTTP API (9090 — `/metrics`) |
+| `worker` | `gophprofile-worker` | 9091 | обработка событий (миниатюры, удаление); 9091 — `/metrics` и `/health` |
+| `jaeger` | `gophprofile-jaeger` | 16686, 4318 | трейсы (UI и OTLP HTTP) |
+| `prometheus` | `gophprofile-prometheus` | 9092 | сбор метрик (9092 — потому что 9090 занят `server`) |
+| `grafana` | `gophprofile-grafana` | 3000 | дашборды: метрики + логи + ссылки в трейсы |
+| `loki` | `gophprofile-loki` | 3100 | хранилище логов |
+| `promtail` | `gophprofile-promtail` | — | сбор логов контейнеров через docker-сокет |
 
 
 ### Как это работает
@@ -203,6 +208,7 @@ flowchart TD
 ```bash
 make up            # поднять весь стек (пересобирает образы)
 make up-infra      # только инфраструктура (postgres, minio, rabbitmq)
+make up-observ     # только стек наблюдаемости (jaeger, prometheus, grafana, loki, promtail)
 make build-images  # собрать образы server и worker без запуска
 make logs          # логи всех сервисов
 make logs-server   # логи server
@@ -238,6 +244,125 @@ runtime-target'а: `server` (с веб-статикой) и `worker`. Бинар
 make run-server  # go run ./cmd/server (миграции применит сам)
 make run-worker  # go run ./cmd/worker (в отдельном терминале)
 ```
+
+## Observability
+
+Стек наблюдаемости поднимается вместе с приложением — это те же сервисы
+`docker/docker-compose.yml` (`jaeger`, `prometheus`, `grafana`, `loki`,
+`promtail`), отдельных конфигураций и запуска не требуется:
+
+```bash
+docker compose -f docker/docker-compose.yml --env-file .env up -d --build --wait
+# или: make up  (весь стек)  /  make up-observ  (только стек наблюдаемости)
+```
+
+### Доступ
+
+| Сервис | URL | Логин |
+|---|---|---|
+| Jaeger UI | http://localhost:16686 | — |
+| Grafana | http://localhost:3000 | admin / admin |
+| Prometheus | http://localhost:9092 | — |
+| Loki (API) | http://localhost:3100 | — |
+| RabbitMQ UI | http://localhost:15672 | guest / guest |
+| RabbitMQ metrics | http://localhost:15692 | — |
+
+Prometheus слушает **9092**, а не 9090: порт 9090 на хосте уже занят
+`/metrics` сервера.
+
+Три сигнала:
+
+- **метрики** — Prometheus каждые 15 с скрейпит `server:9090/metrics`,
+  `worker:9091/metrics` и `rabbitmq:15692/metrics`;
+- **трейсы** — `server` и `worker` шлют спаны по OTLP HTTP на `jaeger:4318`
+  (переменная `OTEL_EXPORTER_OTLP_ENDPOINT` в compose);
+- **логи** — promtail читает stdout контейнеров `server` и `worker` через
+  docker-сокет и пушит их в Loki.
+
+### Трейсинг (Jaeger)
+
+Jaeger UI → **Service**: `gophprofile-server` → **Find Traces**. Один трейс
+`POST /api/v1/avatars` содержит всю цепочку, включая асинхронную работу воркера:
+
+```
+POST /api/v1/avatars          (gophprofile-server)
+  S3.Upload, INSERT, INSERT, RabbitMQ.Publish
+RabbitMQ.Consume              (gophprofile-worker)
+  SELECT, S3.Download, S3.Upload ×2, UPDATE
+```
+
+`RabbitMQ.Publish` и `RabbitMQ.Consume` принадлежат **одному** трейсу: trace
+context переносится в заголовках AMQP (W3C `traceparent`), поэтому в Jaeger
+виден один сквозной трейс, а не два независимых. То же самое видно по логам:
+запись `avatar uploaded` на сервере и `avatar processed` в воркере несут
+одинаковый `trace_id`.
+
+### Метрики (Grafana / Prometheus)
+
+Grafana → **Dashboards** → `GophProfile — Overview`: HTTP requests rate,
+HTTP request duration p95, avatar uploads rate, логи-ошибки.
+
+Напрямую:
+
+```bash
+curl http://localhost:9090/metrics   # server
+curl http://localhost:9091/metrics   # worker
+```
+
+Что смотреть: `http_requests_total`, `http_request_duration_seconds`
+(RED-метрики HTTP) и бизнес-метрики `avatars_uploads_total`,
+`avatars_upload_duration_seconds`, `avatars_deletes_total`,
+`avatars_storage_bytes`, `avatars_file_size_bytes`,
+`avatars_processing_duration_seconds`.
+
+### Метрики RabbitMQ
+
+Инфраструктурные метрики отдаёт сам брокер — плагин `rabbitmq_prometheus`
+(включён в образ `-management`, порт 15692); Prometheus скрейпит джобом
+`rabbitmq`:
+
+```bash
+curl http://localhost:15692/metrics | grep rabbitmq_queue_messages
+```
+
+Глубина очередей: `rabbitmq_queue_messages_ready` (ждут доставки),
+`rabbitmq_queue_messages_unacked` (доставлены, но не подтверждены),
+`rabbitmq_queue_consumers` (число потребителей). Рост `_ready` при нуле
+`_consumers` означает, что воркер не разбирает очередь.
+
+Значения агрегированы по всем очередям (main, retry, DLQ): по умолчанию
+RabbitMQ не отдаёт метрики по объектам, чтобы не раздувать кардинальность.
+Разрез по очередям включается настройкой `prometheus.return_per_object_metrics`
+в `rabbitmq.conf`, если понадобится видеть конкретную забитую очередь.
+
+### Логи (Loki)
+
+Grafana → **Explore** → Loki:
+
+```logql
+{service="server"} |= "error"
+{service="server"} | json | trace_id="1f0bdeedd8637f6caa1bced5c54388ad"
+```
+
+Приложение пишет JSON-логи (slog), а поля `trace_id` и `span_id` подставляются
+автоматически из активного спана. В Loki у `trace_id` настроен derived field,
+ведущий в Jaeger: клик по значению открывает тот же трейс — так лог и трейс
+связываются без ручного поиска.
+
+### `/health` и трейсы
+
+`/health` намеренно исключён из трейсов (`otelhttp.WithFilter`): Docker
+healthcheck обращается к нему каждые 15 секунд, и Jaeger заполнялся бы мусором.
+В метриках (`http_requests_total{path="/health"}`) `/health` при этом остаётся.
+
+### Семантические конвенции OTel
+
+Спаны размечены **актуальными** атрибутами OTel semconv, а не устаревшими
+именами из ТЗ: `db.system.name` (= `postgresql`), `db.query.text` (шаблон
+запроса с плейсхолдерами — значения параметров в трейсы не попадают),
+`aws.s3.bucket` / `aws.s3.key`, `messaging.system` (= `rabbitmq`),
+`messaging.destination.name`, `messaging.rabbitmq.destination.routing_key`,
+`messaging.message.id`.
 
 ## Веб-интерфейс
 

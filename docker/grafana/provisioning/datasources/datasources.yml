@@ -1,0 +1,35 @@
+# Источники данных Grafana: метрики (Prometheus), логи (Loki), трейсы (Jaeger).
+#
+# UID заданы явно у всех трёх: дашборд и derivedFields ссылаются на источники
+# по uid, а не по отображаемому имени — так переименование датасорса в UI не
+# ломает панели и не создаёт «битых» ссылок trace_id → Jaeger.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Клик по trace_id в строке лога открывает этот же трейс в Jaeger:
+      # именно так лог и трейс связываются между собой.
+      derivedFields:
+        - datasourceUid: jaeger
+          matcherRegex: '"trace_id":"(\w+)"'
+          name: TraceID
+          url: '$${__value.raw}'
+
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686

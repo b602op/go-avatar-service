@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,7 +12,9 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/migrator"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services/publisher"
@@ -18,6 +22,7 @@ import (
 	"github.com/b602op/avatars-service/internal/worker"
 	"github.com/b602op/avatars-service/pkg/logger"
 	"github.com/b602op/avatars-service/pkg/resizer"
+	"github.com/b602op/avatars-service/pkg/telemetry"
 )
 
 const (
@@ -27,6 +32,13 @@ const (
 	// подключение к БД укладывается в секунды, а миграции могут создавать
 	// индексы и выполняться заметно дольше.
 	migrationTimeout = 60 * time.Second
+	// shutdownTimeout — время на корректное завершение вспомогательного
+	// HTTP-сервера (метрики и /health).
+	shutdownTimeout = 30 * time.Second
+	// workerMetricsAddr — порт метрик воркера. Отличается от дефолта
+	// config.DefaultMetricsAddr (":9090"), чтобы метрики server и worker можно
+	// было снимать с одного хоста, не путая их.
+	workerMetricsAddr = ":9091"
 )
 
 func main() {
@@ -43,12 +55,77 @@ func main() {
 		os.Exit(1)
 	}
 
-	log := logger.New(cfg.App.LogLevel)
+	log := logger.New(cfg.LogLevel, "worker")
+	// Ошибки OTel SDK пишутся через slog.Warn — без SetDefault они уйдут
+	// в stderr, а не в наш JSON-лог.
+	slog.SetDefault(log)
 	log.Info("starting worker", "config", cfg.String())
 
 	// Контекст отменяется по SIGINT/SIGTERM — запускает graceful shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Трейсинг: OTLP HTTP → Jaeger. Недоступность коллектора не фатальна:
+	// соединение устанавливается лениво, а ошибки экспорта уходят в наш slog
+	// через otel.SetErrorHandler.
+	tpShutdown, err := telemetry.Init(ctx, telemetry.Config{
+		Endpoint:       cfg.OTelEndpoint,
+		ServiceName:    cfg.OTelServiceName + "-worker",
+		ServiceVersion: cfg.OTelServiceVersion,
+		Environment:    cfg.OTelEnvironment,
+	})
+	if err != nil {
+		log.Error("failed to init telemetry", "error", err)
+		os.Exit(1)
+	}
+	// Трейсинг останавливается последним по времени: defer выполняется по LIFO,
+	// а этот зарегистрирован раньше остальных, поэтому к моменту flush воркер,
+	// publisher и пул БД уже закрыты — их shutdown-спаны попадают в батч.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			telemetry.ShutdownTimeout,
+		)
+		defer cancelShutdown()
+
+		// Трейсы — best-effort телеметрия: неудачный flush не должен влиять
+		// на код возврата и шуметь Error-уровнем при штатной остановке.
+		if shutdownErr := tpShutdown(shutdownCtx); shutdownErr != nil {
+			log.Warn("telemetry shutdown failed", "error", shutdownErr)
+		}
+	}()
+
+	// Метрики: воркер — отдельный процесс со своим реестром Prometheus, поэтому
+	// ему нужен свой порт. Явно заданный METRICS_ADDR приоритетнее дефолта.
+	metricsAddr := cfg.MetricsAddr
+	if metricsAddr == config.DefaultMetricsAddr {
+		metricsAddr = workerMetricsAddr
+	}
+
+	// /health здесь же: у воркера нет собственного HTTP-сервера, а healthcheck
+	// контейнера должен что-то опрашивать. В основной Chi-роутер метрики не
+	// добавляем — они не должны быть доступны через публичный API.
+	metricsSrv := api.NewMetricsServer(metricsAddr, log, true)
+	go func() {
+		log.Info("metrics server listening", "addr", metricsSrv.Addr)
+		if serveErr := metricsSrv.ListenAndServe(); serveErr != nil &&
+			!errors.Is(serveErr, http.ErrServerClosed) {
+			log.Error("metrics server failed", "error", serveErr)
+		}
+	}()
+	// Регистрируется после трейсинга: defer выполняется по LIFO, поэтому
+	// метрики останавливаются раньше, чем досылается батч спанов.
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			shutdownTimeout,
+		)
+		defer cancelShutdown()
+
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("failed to shutdown metrics server", "error", err)
+		}
+	}()
 
 	// Отдельный контекст для инициализации зависимостей.
 	initCtx, initCancel := context.WithTimeout(ctx, initTimeout)
@@ -60,6 +137,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Метрики пула воркера — на его собственном порту метрик (:9091).
+	metrics.RegisterDBPoolMetrics(pool)
+
+	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
+	// Горутина завершается по ctx при остановке процесса.
+	go metrics.StartStorageUpdater(ctx, pool, log)
+
 	log.Info("postgres connected")
 
 	// Миграции применяются при старте
