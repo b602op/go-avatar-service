@@ -42,6 +42,10 @@ spec:
       labels:
         app: rabbitmq
     spec:
+      # См. комментарий в 10-postgres.yaml: инфраструктурный SA, fsGroup для тома.
+      serviceAccountName: gophprofile-db-sa
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: rabbitmq
           image: rabbitmq:3-management-alpine
@@ -64,6 +68,25 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/rabbitmq
+          # readOnlyRootFilesystem не включается: брокер пишет в том (mnesia,
+          # логи) и во временные каталоги Erlang.
+          #
+          # Капабилити: см. подробный комментарий в 10-postgres.yaml. Полный drop
+          # ALL тоже не проходит: entrypoint образа от root делает
+          # `find /var/lib/rabbitmq ! -user rabbitmq -exec chown rabbitmq` и затем
+          # `exec su-exec rabbitmq`, то есть нужны те же права на подготовку тома
+          # и сброс привилегий, что и у postgres.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - SETGID
+                - SETUID
           # check_port_connectivity, а не ping: 'ping' отвечает успехом, как
           # только поднялся Erlang-узел, а AMQP-листенер открывается на 3-4
           # секунды позже. Проверка листенеров означает «порт принимает

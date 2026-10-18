@@ -126,3 +126,50 @@ minikube — 6 GB RAM, приложение и инфраструктура за
 (как в iter2) — джобы `server:9090` и `worker:9091` в
 `docker/prometheus/prometheus.yml`; в кластере те же `/metrics` снимаются
 `kubectl port-forward -n gophprofile svc/server 9090:9090`.
+
+### postgres и rabbitmq: `capabilities.drop: [ALL]` без исключений не работает (P2, осознанно)
+
+Проверено: с полным drop оба пода уходили в CrashLoopBackOff. У postgres в логах
+`chmod: /var/lib/postgresql/data/pgdata: Operation not permitted` и
+`find: ... Permission denied`, rabbitmq падал молча (`exitCode: 1`, пустые логи).
+Причина одна: entrypoint обоих образов запускается от root, готовит том
+(`chmod 00700 PGDATA`, `chown postgres` / `find /var/lib/rabbitmq ! -user rabbitmq
+-exec chown`) и только потом сбрасывает привилегии (`gosu postgres` / `su-exec
+rabbitmq`). Root без капабилити — обычный непривилегированный пользователь: прав
+на чужие файлы у него не больше, чем у владельца, а смена uid требует CAP_SETUID.
+
+Поэтому в `10-postgres.yaml` и `12-rabbitmq.yaml` возвращены пять капабилити:
+`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID`. Остальное из дефолтного
+набора Docker (`NET_RAW`, `MKNOD`, `SETPCAP`, ...) остаётся выключенным, а
+`allowPrivilegeEscalation: false` не даёт вернуть привилегии через setuid-бинарник
+в образе. minio (pgsty/silo) работает с полным drop: он не сбрасывает привилегии
+и остаётся root внутри контейнера.
+
+Более чистое решение на будущее — запускать образы БД от их собственных
+непривилегированных пользователей (`runAsUser: 70` для postgres, `100` для
+rabbitmq): entrypoint сам пропускает подготовку тома и сброс привилегий, если
+процесс уже не root, и капабилити не нужны вовсе. Не сделано, потому что требует
+проверки прав на свежем томе для каждого образа, а выигрыш — только в отказе от
+пяти капабилити, которые и так не дают выйти за пределы контейнера.
+
+### worker: порт метрик открыт любому поду кластера (P3)
+
+В `k8s/61-networkpolicy.yaml` у `worker-ingress` правило для порта 9091 задано без
+`from` — то есть метрики воркера доступны из любого namespace. В проде источник
+известен (Prometheus из namespace `monitoring`), поэтому правило нужно сузить до
+`namespaceSelector` этого namespace.
+
+Там же у `server-ingress` открыт только 8080: порт метрик сервера (9090) в
+локальном кластере никто не скрейпит, а в проде его придётся добавить в
+ingress-правило — иначе вместе с включением NetworkPolicy метрики сервера станут
+недоступны.
+
+### fsGroup не действует на hostPath-томах локального кластера (P3)
+
+PV в minikube создаёт provisioner `k8s.io/minikube-hostpath`, а kubelet права на
+hostPath-томах не переписывает: после применения `fsGroup: 1000` каталог
+`/var/lib/postgresql/data` остался `root:root`, `pgdata` — `postgres:root 0700`.
+Фактически fsGroup сработал только как дополнительная группа процесса
+(`id` в поде показывает `groups=...1000`). В проде с CSI-провижнером kubelet
+выставит группу и на файлах — тогда запись в том перестанет зависеть от uid
+образа. Проверять это стоит после смены StorageClass.

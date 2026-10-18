@@ -413,6 +413,76 @@ kubectl port-forward -n gophprofile svc/server 9090:9090
 curl http://localhost:9090/metrics
 ```
 
+## Kubernetes — безопасность (NetworkPolicy, SecurityContext, ServiceAccount)
+
+Деплой в кластер (все манифесты, кроме `50-servicemonitor.yaml`: для него нужен
+Prometheus Operator):
+
+```bash
+kubectl apply -f k8s/00-namespace.yaml -f k8s/01-secret.yaml -f k8s/02-configmap.yaml \
+  -f k8s/10-postgres.yaml -f k8s/11-minio.yaml -f k8s/12-rabbitmq.yaml \
+  -f k8s/20-server.yaml -f k8s/21-worker.yaml -f k8s/30-ingress.yaml \
+  -f k8s/40-hpa.yaml -f k8s/60-serviceaccount.yaml -f k8s/61-networkpolicy.yaml
+```
+
+### ServiceAccount
+
+`k8s/60-serviceaccount.yaml` — два SA (`gophprofile-sa` для server/worker,
+`gophprofile-db-sa` для postgres/minio/rabbitmq), оба с
+`automountServiceAccountToken: false`: приложению Kubernetes API не нужен, и
+токен в поды не монтируется. RBAC (Role/RoleBinding) не добавляется намеренно —
+без токена под не может обращаться к API, а «пустая» роль создавала бы лишь
+видимость прав.
+
+### NetworkPolicy
+
+`k8s/61-networkpolicy.yaml` — пять политик по схеме «default deny + явные
+разрешения»:
+
+| Под | Входящий | Исходящий |
+|---|---|---|
+| `server` | `ingress-nginx` → 8080 | postgres:5432, minio:9000, rabbitmq:5672, DNS (kube-system:53) |
+| `worker` | любой источник → 9091 (метрики) | то же, что у server |
+| `postgres` / `minio` / `rabbitmq` | только от `server` и `worker` | не ограничен (политика задаёт только Ingress) |
+
+DNS разрешён только к `kube-system:53` (UDP и TCP) — внешние резолверы
+приложению не нужны.
+
+Проверено на живом кластере (CNI kindnet в minikube v1.39 политики
+**действительно применяет**):
+
+```bash
+# под в другом namespace не достучится до server
+kubectl run probe --rm -it --image=busybox:1.36 -n default -- \
+  nc -w 3 -z server.gophprofile.svc.cluster.local 8080     # rc=1 — отказ
+# под с меткой app=worker достучится до postgres, но не до server
+kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=worker -- \
+  nc -w 3 -z postgres 5432                                  # rc=0 — доступ есть
+```
+
+### SecurityContext
+
+- **server / worker** — `runAsNonRoot: true`, `runAsUser/runAsGroup: 1000`,
+  `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`,
+  `capabilities.drop: [ALL]`. UID задан явно, а не унаследован из образа (там
+  `app` = uid 100): важно не конкретное число, а непривилегированность.
+  `readOnlyRootFilesystem` проверен на работающем приложении: файловых операций
+  у него нет (картинки обрабатываются в памяти, всё остальное — S3 и PostgreSQL),
+  `touch /app/probe` и `touch /tmp/probe` внутри пода отвечают
+  `Read-only file system`, при этом загрузка, обработка, выдача и удаление
+  аватарок работают.
+- **postgres / rabbitmq** — `fsGroup: 1000`, `allowPrivilegeEscalation: false`,
+  `capabilities.drop: [ALL]` плюс минимальный возврат (`CHOWN`, `DAC_OVERRIDE`,
+  `FOWNER`, `SETGID`, `SETUID`). Полный drop у этих образов не работает:
+  entrypoint'ы стартуют от root, готовят том (`chmod`/`chown`) и лишь затем
+  сбрасывают привилегии через `gosu`/`su-exec` — без этих капабилити поды уходят
+  в CrashLoopBackOff (подробности в `docs/tech-debt.md`).
+- **minio** — `fsGroup: 1000`, `allowPrivilegeEscalation: false`, полный
+  `capabilities.drop: [ALL]`: этот образ привилегий не сбрасывает и внутри
+  контейнера остаётся root.
+- `readOnlyRootFilesystem` для БД и брокера не включается: они пишут не только в
+  том, но и во временные каталоги.
+
 ## Веб-интерфейс
 
 Простой одностраничный веб-интерфейс для загрузки аватарок доступен по адресу `http://localhost:8080/web/upload`. Он находится в файле `web/static/index.html`.

@@ -37,6 +37,14 @@ spec:
       labels:
         app: worker
     spec:
+      # См. комментарий в 20-server.yaml: SA без автомонтирования токена,
+      # явные uid/gid вместо унаследованных из образа.
+      serviceAccountName: gophprofile-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       # См. комментарий в 20-server.yaml: ждём готовности postgres, minio и
       # rabbitmq, иначе воркер падает на старте (он тоже проверяет бакет и
       # подключается к брокеру) и уходит в CrashLoopBackOff.
@@ -107,6 +115,15 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
+          # См. комментарий в 20-server.yaml: воркер тоже ничего не пишет на
+          # диск (картинки обрабатываются в памяти, результат уходит в S3),
+          # поэтому корневая ФС монтируется только для чтения.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           # Воркерский /health — liveness, а не проверка зависимостей: он
           # подтверждает, что процесс жив и обслуживает вспомогательный
           # HTTP-сервер. Подключения к БД/S3/RabbitMQ проверяются на старте,

@@ -39,6 +39,10 @@ spec:
       labels:
         app: minio
     spec:
+      # См. комментарий в 10-postgres.yaml: инфраструктурный SA, fsGroup для тома.
+      serviceAccountName: gophprofile-db-sa
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: minio
           image: pgsty/silo:latest
@@ -67,6 +71,13 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          # readOnlyRootFilesystem не включается: хранилищу нужен записываемый
+          # том, а его собственные временные каталоги лежат вне /data.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           # /minio/health/live — liveness-эндпоинт самого хранилища: отвечает,
           # пока процесс обслуживает S3 API.
           livenessProbe:
