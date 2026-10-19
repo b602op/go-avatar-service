@@ -76,20 +76,106 @@ make up
 ## Архитектура
 
 ```mermaid
-flowchart LR
-    Client[Внешний сервис / SPA] -->|HTTP| Server[server :8080]
-    Server -->|SQL: metadata| PG[(PostgreSQL)]
-    Server -->|"S3 API: upload,<br/>download (content)"| S3[(MinIO / S3)]
-    Server -->|publish events| RMQ([RabbitMQ])
-    RMQ -->|consume events| Worker[worker]
-    Worker -->|S3 API: download original,<br/>upload thumbnails 100×100, 300×300| S3
-    Worker -->|SQL: update processing_status | PG
+flowchart TB
+    subgraph External["Внешний мир"]
+        Client["🌐 Клиент (SPA / curl)"]
+        Dev["👨‍💻 Разработчик<br/>(kubectl / helm)"]
+    end
+
+    subgraph K8s["☸️ Kubernetes (minikube)"]
+        subgraph IngressLayer["Слой доступа"]
+            Ingress["🚪 Ingress<br/>gophprofile.local<br/>proxy-body-size: 10m"]
+        end
+
+        subgraph AppLayer["Приложение (Deployment)"]
+            SvcServer["⚖️ Service server<br/>ClusterIP:80"]
+            ServerPod1["🐳 Pod server-1<br/>(replica 1)"]
+            ServerPod2["🐳 Pod server-2<br/>(replica 2)"]
+            HPA["📈 HPA<br/>min 2, max 10<br/>CPU 70%, RAM 80%"]
+            SvcWorker["⚖️ Service worker<br/>ClusterIP:9091"]
+            WorkerPod["🐳 Pod worker<br/>(replica 1)"]
+        end
+
+        subgraph InfraLayer["Инфраструктура (StatefulSet)"]
+            Postgres["🗄️ PostgreSQL<br/>StatefulSet + PVC 1Gi"]
+            Minio["📦 MinIO/Silo<br/>StatefulSet + PVC 1Gi"]
+            RabbitMQ["🐇 RabbitMQ<br/>StatefulSet + PVC 1Gi"]
+        end
+
+        subgraph Security["Безопасность"]
+            NetPol["🛡️ NetworkPolicy<br/>default deny"]
+            SecCtx["🔒 SecurityContext<br/>non-root, read-only"]
+            SA["🆔 ServiceAccount<br/>no token"]
+        end
+
+        subgraph Config["Конфигурация"]
+            CM["📝 ConfigMap<br/>env"]
+            Secret["🔑 Secret<br/>пароли"]
+            HelmChart["📦 Helm Chart<br/>values-dev / values-prod"]
+            MigrationJob["⚙️ Job (post-install)<br/>MIGRATE_ONLY"]
+        end
+
+        subgraph Observability["Наблюдаемость"]
+            Metrics["📊 /metrics :9090/:9091"]
+            ServiceMonitor["📡 ServiceMonitor<br/>(артефакт, CRD нет)"]
+            Logs["📋 JSON logs + trace_id<br/>(Loki)"]
+        end
+    end
+
+    subgraph ExternalObs["Внешняя наблюдаемость (в проде)"]
+        Prometheus["🔥 Prometheus"]
+        Jaeger["🔍 Jaeger"]
+        Grafana["📈 Grafana"]
+    end
+
+    Client -->|"HTTP (Host: gophprofile.local)"| Ingress
+    Dev -->|"helm install / kubectl apply"| HelmChart
+    Ingress -->|"/api/v1/*"| SvcServer
+    SvcServer --> ServerPod1
+    SvcServer --> ServerPod2
+    HPA -.->|"scale"| ServerPod1
+    HPA -.->|"scale"| ServerPod2
+    ServerPod1 -->|"SQL"| Postgres
+    ServerPod1 -->|"S3 API"| Minio
+    ServerPod1 -->|"publish"| RabbitMQ
+    RabbitMQ -->|"consume"| WorkerPod
+    WorkerPod -->|"S3 API"| Minio
+    WorkerPod -->|"SQL"| Postgres
+    WorkerPod -.->|"metrics"| SvcWorker
     
-    style Server fill:#4A90D9,color:#fff
-    style Worker fill:#7B68EE,color:#fff
-    style PG fill:#336791,color:#fff
-    style S3 fill:#C72C48,color:#fff
-    style RMQ fill:#FF6600,color:#fff
+    HelmChart -.->|"templates"| ServerPod1
+    HelmChart -.->|"templates"| WorkerPod
+    HelmChart -.->|"templates"| Postgres
+    HelmChart -.->|"templates"| Minio
+    HelmChart -.->|"templates"| RabbitMQ
+    MigrationJob -->|"migrations"| Postgres
+    
+    NetPol -.->|"ограничивает"| ServerPod1
+    NetPol -.->|"ограничивает"| WorkerPod
+    SecCtx -.->|"применяется к"| ServerPod1
+    SA -.->|"для"| MigrationJob
+    
+    ServerPod1 -->|"отдаёт"| Metrics
+    WorkerPod -->|"отдаёт"| Metrics
+    ServiceMonitor -.->|"scrape"| Metrics
+    ServerPod1 -->|"logs"| Logs
+    WorkerPod -->|"logs"| Logs
+    
+    Metrics -.->|"в проде"| Prometheus
+    Logs -.->|"в проде"| Grafana
+    Prometheus -.-> Grafana
+
+    style Ingress fill:#00ADD8,color:#fff
+    style ServerPod1 fill:#4A90D9,color:#fff
+    style ServerPod2 fill:#4A90D9,color:#fff
+    style WorkerPod fill:#7B68EE,color:#fff
+    style Postgres fill:#336791,color:#fff
+    style Minio fill:#C72C48,color:#fff
+    style RabbitMQ fill:#FF6600,color:#fff
+    style HPA fill:#FFD700,color:#000
+    style NetPol fill:#2E8B57,color:#fff
+    style HelmChart fill:#326CE5,color:#fff
+    style MigrationJob fill:#8B4513,color:#fff
 ```
 
 ### Что поднимается
@@ -222,11 +308,14 @@ make down-v        # остановить и удалить volumes (полна�
 Проверка состояния приложения:
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8080/health   # состояние зависимостей: 200 | 503
+curl http://localhost:8080/live     # процесс жив: всегда 200 {"status":"ok"}
 ```
 
 `/health` опрашивает БД, S3 и брокер: `200` — всё в порядке, `503` — часть
-зависимостей недоступна (в теле ответа видно, какая именно).
+зависимостей недоступна (в теле ответа видно, какая именно). `/live` ничего не
+проверяет и отвечает мгновенно — он отвечает на другой вопрос (см.
+«Liveness и readiness» в разделе про production-готовность).
 
 ### Образы
 
@@ -350,11 +439,13 @@ Grafana → **Explore** → Loki:
 ведущий в Jaeger: клик по значению открывает тот же трейс — так лог и трейс
 связываются без ручного поиска.
 
-### `/health` и трейсы
+### Служебные эндпоинты и трейсы
 
-`/health` намеренно исключён из трейсов (`otelhttp.WithFilter`): Docker
-healthcheck обращается к нему каждые 15 секунд, и Jaeger заполнялся бы мусором.
-В метриках (`http_requests_total{path="/health"}`) `/health` при этом остаётся.
+`/health` и `/live` намеренно исключены из трейсов (`otelhttp.WithFilter` по
+`isServicePath`): kubelet обращается к ним каждые 5–15 секунд, и Jaeger
+заполнялся бы мусором. В метриках (`http_requests_total{path="/health"}`) они при
+этом остаются. Те же пути исключены из rate limit — иначе 429 на `/live` означал
+бы перезапуск здорового пода при всплеске трафика.
 
 ### Семантические конвенции OTel
 
@@ -584,6 +675,118 @@ kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=work
   контейнера остаётся root.
 - `readOnlyRootFilesystem` для БД и брокера не включается: они пишут не только в
   том, но и во временные каталоги.
+
+## Production-готовность (circuit breaker, rate limiting, graceful shutdown)
+
+Три механизма, которые нужны сервису под реальной нагрузкой: устойчивость к
+лежащим зависимостям, защита от лавины запросов и корректное завершение подов.
+
+### Circuit breaker (S3 и RabbitMQ)
+
+`internal/services/circuitbreaker` — обёртка над `github.com/sony/gobreaker/v2`.
+Настройки: 5 неудач **подряд** открывают breaker на 30 секунд, затем half-open
+пропускает 3 пробных вызова, и если все успешны — breaker закрывается.
+`Interval = 0`, то есть счётчики не сбрасываются по времени: «подряд» — это
+именно подряд, сбрасывает счётчик только успешный вызов.
+
+Оборачиваются только обращения к внешним зависимостям:
+
+| Зависимость | Что под breaker'ом | Что намеренно вне |
+|---|---|---|
+| S3 | `Upload`, `Download`, `StatObject`, `Delete`, `DeleteMany` | `EnsureBucket`, `HealthCheck` |
+| RabbitMQ | публикация события (`PublishWithContext`) | подключение и объявление топологии |
+
+- **БД не оборачивается**: `pgxpool` сам ретраит и держит пул, а открытый
+  breaker вернул бы 503 даже тогда, когда соединение поднимается за миллисекунды.
+- **`EnsureBucket` / `HealthCheck` вне breaker'а**: они отвечают на вопрос
+  «доступно ли хранилище вообще». Ответ «breaker открыт» здесь был бы подменой
+  реального состояния зависимости — ровно то, что `/health` должен показывать
+  честно.
+- **404 в S3 не считается сбоем** (`WithIsExcluded`): удалённая аватарка —
+  штатный ответ, и пять запросов к ней не должны ронять весь S3-путь. При этом
+  такой ответ и не сбрасывает серию реальных неудач.
+- Ошибки библиотеки не протекают наружу: вызывающая сторона видит только
+  `circuitbreaker.ErrCircuitOpen`, независимо от того, отверг ли запрос
+  открытый breaker (`gobreaker.ErrOpenState`) или исчерпанный лимит запросов в
+  half-open (`gobreaker.ErrTooManyRequests`). Переходы состояний логируются
+  (открытие — `Warn`).
+
+### Rate limiting
+
+`internal/api.RateLimit` — общий на процесс token bucket (`golang.org/x/time/rate`),
+включён после `RequestLogger`, поэтому 429 попадает и в логи, и в метрики.
+
+```bash
+RATE_LIMIT_RPS=100     # среднее число запросов в секунду (0 — лимит выключен)
+RATE_LIMIT_BURST=200   # допустимый всплеск сверх среднего
+```
+
+Лимит общий, а не per-client: цель — защитить сервис и его зависимости от
+лавины запросов. За прокси все клиенты видят один IP, поэтому лимит по
+`RemoteAddr` был бы и несправедлив, и обходим. Превышение — `429 Too Many
+Requests` с заголовком `Retry-After: 1`.
+
+### Liveness и readiness — два разных эндпоинта
+
+Пробы отвечают на разные вопросы, и путать их нельзя:
+
+| Проба | Эндпоинт | Что проверяет | Что происходит при отказе |
+|---|---|---|---|
+| `livenessProbe` | `/live` | только «процесс жив и отвечает на HTTP» | kubelet перезапускает контейнер |
+| `readinessProbe` | `/health` | БД, S3 и брокер | под исключается из `Endpoints`, трафик на него не идёт |
+
+`/live` не делает ни одного внешнего вызова и отвечает безусловно
+`200 {"status":"ok"}` — поэтому «зависнуть» или ответить ошибкой из-за
+зависимости он не может. `/health` — наоборот, полная проверка: `200` — всё в
+порядке, `503` — часть зависимостей недоступна (в теле видно, какая именно).
+
+Почему это важно: если повесить liveness на `/health`, падение S3 начнёт
+перезапускать поды. Процесс при этом жив, а старт приложения требует доступного
+S3 (`EnsureBucket` вызывается безусловно, без ретраев) — то есть рестарт не
+лечит ничего и превращается в `CrashLoopBackOff`. С разделёнными пробами
+поведение корректное: под остаётся `Running`, но `NotReady`, и возвращается в
+балансировку сам, когда зависимости поднимутся.
+
+Проверено на кластере: `kubectl scale statefulset/minio --replicas=0` →
+`server` в состоянии `0/1 Running` без рестартов, в логах
+`circuit breaker opened breaker=s3`; после возврата minio breaker переходит
+`open → half-open → closed`, под снова `1/1 Ready`.
+
+### Graceful shutdown
+
+В `k8s/20-server.yaml` и `helm/gophprofile/templates/20-server.yaml`:
+
+```yaml
+terminationGracePeriodSeconds: 30
+# ...
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "sleep 5"]
+```
+
+При удалении пода kubelet сначала выполняет `preStop`, и только потом шлёт
+`SIGTERM`. Пауза в 5 секунд нужна, чтобы под успел уйти из `Endpoints` сервиса
+(kube-proxy замечает это асинхронно) и трафик перестал приходить **до** того,
+как процесс начнёт завершаться — иначе запросы из этого окна рвутся с ошибкой
+соединения. 30 секунд `terminationGracePeriodSeconds` с запасом покрывают
+`preStop` (5s) и догрузку in-flight запросов.
+
+### Тесты
+
+```bash
+# Без внешних зависимостей: сам breaker, rate limit, конфиг
+go test ./internal/services/circuitbreaker/... ./internal/api/... ./internal/config/...
+
+# Breaker в реальных клиентах: S3-тесты ходят на S3_ENDPOINT (по умолчанию
+# localhost:9000), тесты publisher'а поднимают RabbitMQ через testcontainers
+go test ./internal/services/s3/... ./internal/services/publisher/...
+```
+
+В `internal/services/s3` есть три теста breaker'а, которым живое хранилище не
+нужно: клиент направляется на закрытый порт, и проверяется, что после пяти
+неудач операции начинают коротко замыкаться (`ErrCircuitOpen`), а
+`HealthCheck` — нет (он вне breaker'а).
 
 ## Веб-интерфейс
 

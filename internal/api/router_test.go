@@ -108,6 +108,35 @@ func TestRouter_Health_NilHandler(t *testing.T) {
 	assert.Equal(t, "down", resp.Status)
 }
 
+// TestRouter_Live проверяет, что liveness-эндпоинт отвечает 200 и не зависит от
+// состояния зависимостей: роутер собран вообще без хендлера /health.
+func TestRouter_Live(t *testing.T) {
+	router := NewRouter(RouterDeps{})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"status":"ok"}`, rec.Body.String())
+}
+
+// TestRouter_Live_IndependentFromHealth — контракт проб: /live отвечает 200
+// даже тогда, когда /health отдаёт 503 (зависимости недоступны). Именно это
+// различие не даёт kubelet перезапускать под из-за лежащего S3.
+func TestRouter_Live_IndependentFromHealth(t *testing.T) {
+	// Роутер без Health: /health честно отвечает 503 («down»).
+	router := NewRouter(RouterDeps{})
+
+	healthRec := httptest.NewRecorder()
+	router.ServeHTTP(healthRec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	require.Equal(t, http.StatusServiceUnavailable, healthRec.Code)
+
+	liveRec := httptest.NewRecorder()
+	router.ServeHTTP(liveRec, httptest.NewRequest(http.MethodGet, "/live", nil))
+	assert.Equal(t, http.StatusOK, liveRec.Code)
+}
+
 func TestRouter_RootRedirectsToWebUpload(t *testing.T) {
 	router := NewRouter(RouterDeps{})
 

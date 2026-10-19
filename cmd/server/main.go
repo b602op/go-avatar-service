@@ -217,6 +217,8 @@ func run() (err error) {
 		AvatarHandler:  avatarHandler,
 		Health:         healthHandler,
 		AllowedOrigins: []string{"*"},
+		RateLimitRPS:   cfg.HTTP.RateLimitRPS,
+		RateLimitBurst: cfg.HTTP.RateLimitBurst,
 	})
 
 	srv := &http.Server{

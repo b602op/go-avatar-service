@@ -35,6 +35,10 @@ type RouterDeps struct {
 	Health http.HandlerFunc
 	// AllowedOrigins — список разрешённых Origin для CORS ("*" — все).
 	AllowedOrigins []string
+	// RateLimitRPS и RateLimitBurst — параметры общего лимита частоты запросов
+	// (см. RateLimit). Нулевые значения отключают лимит.
+	RateLimitRPS   float64
+	RateLimitBurst int
 }
 
 // NewRouter собирает Chi-роутер с middleware и маршрутами.
@@ -52,16 +56,19 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	//  2. RealIP — подменяет RemoteAddr до логирования;
 	//  3. otelhttp — создаёт спан на запрос. Всё, что зарегистрировано ниже,
 	//     видит активный span, поэтому логи получают trace_id/span_id.
-	//     /health исключён из трейсов (Docker healthcheck — не бизнес-трафик,
-	//     иначе Jaeger забивается мусором каждые 10 секунд). Метрики /health
-	//     при этом считаются — фильтр действует только на спаны;
+	//     Служебные /health и /live исключены из трейсов (это не бизнес-трафик:
+	//     kubelet опрашивает их каждые 5–15 секунд, иначе Jaeger забивается
+	//     мусором). Метрики по ним при этом считаются — фильтр действует
+	//     только на спаны;
 	//  4. RequestLogger — пишет лог уже с trace_id;
-	//  5. Recoverer — паника попадает в лог как 500, а не как разорванный ответ;
-	//  6. Timeout — верхняя граница обработки запроса;
-	//  7. Metrics — HTTP-метрики (RED). Обязательно после otelhttp: шаблон
+	//  5. RateLimit — отклонённые запросы (429) попадают в лог и метрики, а
+	//     лежащие под ним зависимости не получают трафика вообще;
+	//  6. Recoverer — паника попадает в лог как 500, а не как разорванный ответ;
+	//  7. Timeout — верхняя граница обработки запроса;
+	//  8. Metrics — HTTP-метрики (RED). Обязательно после otelhttp: шаблон
 	//     маршрута доступен только после матчинга в Chi, то есть на возврате
 	//     из next.ServeHTTP;
-	//  8. CORS — заголовки ставятся до ухода в хендлер.
+	//  9. CORS — заголовки ставятся до ухода в хендлер.
 	r.Use(middleware.RequestID)
 	// RealIP подменяет r.RemoteAddr значением из X-Forwarded-For / X-Real-IP.
 	// В chi v5 он помечен deprecated (GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp,
@@ -75,7 +82,7 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	r.Use(middleware.RealIP) //nolint:staticcheck // SA1019: см. комментарий выше
 	r.Use(otelhttp.NewMiddleware(otelOperation,
 		otelhttp.WithFilter(func(r *http.Request) bool {
-			return r.URL.Path != "/health"
+			return !isServicePath(r.URL.Path)
 		}),
 		otelhttp.WithSpanNameFormatter(func(_ string, req *http.Request) string {
 			if p := chi.RouteContext(req.Context()).RoutePattern(); p != "" {
@@ -85,6 +92,7 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 		}),
 	))
 	r.Use(RequestLogger(log))
+	r.Use(RateLimit(deps.RateLimitRPS, deps.RateLimitBurst))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 	r.Use(Metrics())
@@ -100,6 +108,16 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 		health = handlers.Health(nil, nil, nil, log)
 	}
 	r.Get("/health", health)
+
+	// /live — liveness-проба: «процесс жив и отвечает на HTTP». Зависимости не
+	// проверяются, поэтому эндпоинт не может упасть из-за S3/БД/брокера.
+	//
+	// Разделение принципиальное: /health используется как readinessProbe
+	// (падение зависимости выводит под из балансировки, и это правильно),
+	// /live — как livenessProbe. Если liveness повесить на /health, падение S3
+	// начнёт перезапускать поды: процесс-то жив, а старт приложения требует
+	// доступного S3 (EnsureBucket), поэтому рестарт ведёт в CrashLoopBackOff.
+	r.Get("/live", handlers.Live)
 
 	// Корень отдаёт форму загрузки: без этого открытие http://host:8080/
 	// чтобы у страницы оставался один канонический адрес /web/upload.

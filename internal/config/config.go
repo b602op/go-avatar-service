@@ -52,6 +52,12 @@ type HTTPConfig struct {
 	Port         string
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+
+	// RateLimitRPS и RateLimitBurst — параметры общего лимита частоты запросов
+	// (token bucket, см. api.RateLimit): среднее число запросов в секунду и
+	// допустимый всплеск. Ноль или отрицательное значение отключает лимит.
+	RateLimitRPS   float64
+	RateLimitBurst int
 }
 
 // PostgresConfig — параметры подключения к PostgreSQL.
@@ -126,6 +132,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
+	rateLimitRPS, err := getEnvFloat("RATE_LIMIT_RPS", 100)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	rateLimitBurst, err := getEnvInt("RATE_LIMIT_BURST", 200)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	cfg := &Config{
 		App: AppConfig{
@@ -138,9 +152,11 @@ func Load() (*Config, error) {
 		OTelServiceVersion: getEnv("OTEL_SERVICE_VERSION", "dev"),
 		OTelEnvironment:    getEnv("OTEL_ENVIRONMENT", "dev"),
 		HTTP: HTTPConfig{
-			Port:         getEnv("HTTP_PORT", "8080"),
-			ReadTimeout:  readTimeout,
-			WriteTimeout: writeTimeout,
+			Port:           getEnv("HTTP_PORT", "8080"),
+			ReadTimeout:    readTimeout,
+			WriteTimeout:   writeTimeout,
+			RateLimitRPS:   rateLimitRPS,
+			RateLimitBurst: rateLimitBurst,
 		},
 		Postgres: PostgresConfig{
 			Host:     requiredEnv("POSTGRES_HOST", "localhost", isProd),
@@ -258,7 +274,8 @@ func (c PostgresConfig) ValidateDSN() error {
 // String возвращает человекочитаемое представление конфига с маскировкой секретов.
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"Config{App={Env:%s}, LogLevel:%s, HTTP={Port:%s ReadTimeout:%s WriteTimeout:%s}, "+
+		"Config{App={Env:%s}, LogLevel:%s, HTTP={Port:%s ReadTimeout:%s WriteTimeout:%s "+
+			"RateLimitRPS:%g RateLimitBurst:%d}, "+
 			"Metrics={Addr:%s}, "+
 			"Postgres={Host:%s Port:%s User:%s Password:%s DB:%s SSLMode:%s}, "+
 			"S3={Endpoint:%s Bucket:%s Region:%s AccessKey:%s SecretKey:%s UseSSL:%t}, "+
@@ -266,6 +283,7 @@ func (c Config) String() string {
 			"OTel={Endpoint:%s ServiceName:%s ServiceVersion:%s Environment:%s}}",
 		c.App.Env, c.LogLevel,
 		c.HTTP.Port, c.HTTP.ReadTimeout, c.HTTP.WriteTimeout,
+		c.HTTP.RateLimitRPS, c.HTTP.RateLimitBurst,
 		c.MetricsAddr,
 		c.Postgres.Host, c.Postgres.Port, c.Postgres.User, mask(c.Postgres.Password),
 		c.Postgres.DB, c.Postgres.SSLMode,
@@ -344,6 +362,34 @@ func getEnvBool(key string, def bool) (bool, error) {
 	v, err := strconv.ParseBool(raw)
 	if err != nil {
 		return def, fmt.Errorf("%s must be a boolean (true|false), got %q", key, raw)
+	}
+	return v, nil
+}
+
+// getEnvFloat парсит число с плавающей точкой из переменной окружения.
+// Возвращает понятную ошибку с цитатой значения при невалидном формате.
+func getEnvFloat(key string, def float64) (float64, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return def, fmt.Errorf("%s must be a number, got %q", key, raw)
+	}
+	return v, nil
+}
+
+// getEnvInt парсит целое число из переменной окружения.
+// Возвращает понятную ошибку с цитатой значения при невалидном формате.
+func getEnvInt(key string, def int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def, fmt.Errorf("%s must be an integer, got %q", key, raw)
 	}
 	return v, nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 )
 
 // Параметры заголовка X-User-ID.
@@ -34,7 +35,62 @@ var (
 	_ func(http.Handler) http.Handler = UserID()
 	_ func(http.Handler) http.Handler = CORS([]string{"*"})
 	_ func(http.Handler) http.Handler = Metrics()
+	_ func(http.Handler) http.Handler = RateLimit(100, 200)
 )
+
+// RateLimit ограничивает суммарную частоту HTTP-запросов ко всем маршрутам.
+//
+// rps — среднее число запросов в секунду, burst — допустимый всплеск сверх
+// среднего. Лимит общий на процесс (не на клиента): цель — защитить сервис и
+// его зависимости (БД, S3, RabbitMQ) от лавины запросов, а не справедливо
+// поделить полосу между пользователями. За прокси все клиенты видят один IP,
+// поэтому per-IP лимит по RemoteAddr был бы и несправедлив, и обходим.
+//
+// Превышение лимита — 429 Too Many Requests с Retry-After: 1: клиенту сообщается,
+// что повторить запрос имеет смысл, и через сколько секунд.
+//
+// rps <= 0 или burst <= 0 трактуются как «лимит выключен». Это нужно и для
+// тестов, собирающих роутер с нулевыми зависимостями: limiter с нулевым burst
+// отклонял бы вообще все запросы.
+func RateLimit(rps float64, burst int) func(http.Handler) http.Handler {
+	if rps <= 0 || burst <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+
+	// Один limiter на весь процесс: token bucket, который пополняется со
+	// скоростью rps и допускает всплеск до burst запросов.
+	limiter := rate.NewLimiter(rate.Limit(rps), burst)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Пробы kubelet не расходуют токены: 429 на /live означал бы, что
+			// при всплеске трафика под перезапустят, хотя он полностью здоров.
+			// Служебные эндпоинты дешёвые (ответ из памяти, без обращений к
+			// зависимостям), поэтому защищать их лимитом нечего.
+			if isServicePath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if !limiter.Allow() {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// isServicePath сообщает, что путь — служебный: его опрашивает kubelet, а не
+// пользователь. Такие пути не трейсятся и не упираются в общий лимит частоты.
+//
+// Список явный, а не по префиксу: под лимитом и трейсингом остаётся весь
+// пользовательский трафик (/api/v1, /web, /), а освобождаются только
+// health-эндпоинты.
+func isServicePath(path string) bool {
+	return path == "/health" || path == "/live"
+}
 
 // RequestLogger логирует каждый HTTP-запрос.
 //
