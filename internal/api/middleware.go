@@ -30,12 +30,16 @@ const unknownRoute = "unknown"
 var userIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Проверки на этапе компиляции: middleware возвращают стандартную сигнатуру.
+//
+// Metrics проверяется как значение функции, а не вызовом: вызов на этапе
+// инициализации пакета создал бы метрики в реестре по умолчанию раньше, чем
+// main успел бы передать свой набор (и NewMetrics упал бы на дубликате).
 var (
-	_ func(http.Handler) http.Handler = RequestLogger(slog.Default())
-	_ func(http.Handler) http.Handler = UserID()
-	_ func(http.Handler) http.Handler = CORS([]string{"*"})
-	_ func(http.Handler) http.Handler = Metrics()
-	_ func(http.Handler) http.Handler = RateLimit(100, 200)
+	_ func(http.Handler) http.Handler                           = RequestLogger(slog.Default())
+	_ func(http.Handler) http.Handler                           = UserID()
+	_ func(http.Handler) http.Handler                           = CORS([]string{"*"})
+	_ func(...*metrics.Metrics) func(http.Handler) http.Handler = Metrics
+	_ func(http.Handler) http.Handler                           = RateLimit(100, 200)
 )
 
 // RateLimit ограничивает суммарную частоту HTTP-запросов ко всем маршрутам.
@@ -133,13 +137,21 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 
 // Metrics собирает HTTP-метрики (RED) и отдаёт их в Prometheus.
 //
+// Без аргументов использует metrics.Default(); явно переданный набор позволяет
+// тестам писать в собственный реестр, не смешивая наблюдения.
+//
 // Регистрируется ПОСЛЕ otelhttp и до CORS: Chi выполняет middleware в порядке
 // объявления, а шаблон маршрута появляется только после матчинга, то есть
 // к моменту возврата из next.ServeHTTP. Поэтому chi.RouteContext(...).
 // RoutePattern() внутри Metrics уже заполнен и даёт "/api/v1/avatars/{avatar_id}",
 // а не конкретный URL — кардинальность метки path остаётся на уровне числа
 // маршрутов.
-func Metrics() func(http.Handler) http.Handler {
+func Metrics(ms ...*metrics.Metrics) func(http.Handler) http.Handler {
+	m := metrics.Default()
+	if len(ms) > 0 && ms[0] != nil {
+		m = ms[0]
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
@@ -165,8 +177,8 @@ func Metrics() func(http.Handler) http.Handler {
 			}
 
 			statusLabel := strconv.Itoa(status)
-			metrics.HTTPRequestsTotal.WithLabelValues(r.Method, path, statusLabel).Inc()
-			metrics.HTTPRequestDuration.WithLabelValues(r.Method, path, statusLabel).
+			m.HTTPRequestsTotal.WithLabelValues(r.Method, path, statusLabel).Inc()
+			m.HTTPRequestDuration.WithLabelValues(r.Method, path, statusLabel).
 				Observe(time.Since(start).Seconds())
 		})
 	}

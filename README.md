@@ -6,6 +6,10 @@
 
 Проект "Аватарница" — это микросервис для управления аватарками пользователей. Он предоставляет REST API для загрузки, получения и удаления изображений, а также простой веб-интерфейс для взаимодействия с сервисом.
 
+Подробнее об устройстве сервиса, потоках запросов и Kubernetes-архитектуре —
+[docs/architecture.md](docs/architecture.md). Спецификация HTTP API —
+[docs/openapi.yaml](docs/openapi.yaml).
+
 ## Структура проекта
 
 Проект имеет следующую структуру, основанную на лучших практиках разработки на Go:
@@ -369,6 +373,12 @@ Prometheus слушает **9092**, а не 9090: порт 9090 на хосте 
 - **логи** — promtail читает stdout контейнеров `server` и `worker` через
   docker-сокет и пушит их в Loki.
 
+В Kubernetes эти же сигналы сохраняются: метрики отдаются на `:9090` (server) и
+`:9091` (worker), трейсы уходят по OTLP на Jaeger, логи остаются JSON с
+`trace_id`. Обнаружение метрик в кластере — через ServiceMonitor, для которого
+нужен Prometheus Operator; подробности и ограничения локального стенда — в
+разделе «Kubernetes — мониторинг (ServiceMonitor)».
+
 ### Трейсинг (Jaeger)
 
 Jaeger UI → **Service**: `gophprofile-server` → **Find Traces**. Один трейс
@@ -455,6 +465,118 @@ Grafana → **Explore** → Loki:
 `aws.s3.bucket` / `aws.s3.key`, `messaging.system` (= `rabbitmq`),
 `messaging.destination.name`, `messaging.rabbitmq.destination.routing_key`,
 `messaging.message.id`.
+
+## Запуск в Kubernetes
+
+Ниже — минимальный путь от исходников до работающего стенда в minikube.
+Детали чарта, окружений и хука миграций — в следующем разделе.
+
+### Требования
+
+- Docker и minikube (проверено на minikube v1.39, Kubernetes v1.37);
+- `kubectl` и Helm 3.x (проверено на Helm v3.16.4);
+- включённый ingress-контроллер: `minikube addons enable ingress`;
+- не менее ~4 GB RAM для ноды: приложение и инфраструктура занимают ~1.5 GB,
+  остальное нужно minikube и ingress-nginx;
+- внешний registry не требуется — образы собираются локально и загружаются
+  в кластер.
+
+### Сборка и загрузка образов
+
+`Dockerfile` содержит два runtime-target'а — `server` (HTTP API и веб-статика)
+и `worker` (асинхронная обработка). Оба бинарника собираются из одного
+builder-слоя:
+
+```bash
+docker build --target server -t gophprofile-server:latest .
+docker build --target worker -t gophprofile-worker:latest .
+
+minikube image load gophprofile-server:latest
+minikube image load gophprofile-worker:latest
+```
+
+Имена образов совпадают с `server.image.repository` и `worker.image.repository`
+в `helm/gophprofile/values.yaml`. При `imagePullPolicy: IfNotPresent` кластер
+берёт локально загруженные образы и не ходит в Docker Hub.
+
+### Установка
+
+```bash
+helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace
+```
+
+Чарт создаёт PostgreSQL, MinIO, RabbitMQ, Deployment'ы `server` и `worker`,
+Service'ы, Ingress, HPA, ServiceAccount'ы и NetworkPolicy. Job миграций —
+`post-install` хук: он запускается после создания объектов релиза, применяет
+схему и удаляется после успеха (`hook-delete-policy: hook-succeeded`), поэтому
+в `kubectl get jobs` его обычно уже нет.
+
+Проверка:
+
+```bash
+kubectl get pods -n gophprofile
+kubectl get ingress -n gophprofile
+helm status gophprofile -n gophprofile
+```
+
+Ожидаемое состояние — все поды `Running`/`Ready`, `server` в двух репликах
+(значение по умолчанию), HPA видит метрики и не упирается в ошибки.
+
+### Доступ к сервису
+
+Через Ingress (хост из `ingress.host`, по умолчанию `gophprofile.local`).
+В minikube ingress-контроллер обычно опубликован как NodePort:
+
+```bash
+NODE_PORT=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}')
+curl -H 'Host: gophprofile.local' "http://$(minikube ip):${NODE_PORT}/health"
+```
+
+Если DNS-имя не резолвится, добавьте его в `hosts` или используйте
+`curl --resolve gophprofile.local:${NODE_PORT}:$(minikube ip)`. На Windows/WSL
+адрес ноды и способ проброса зависят от драйвера minikube; альтернатива для
+отладки — port-forward (он идёт через API-сервер и не проверяет
+Ingress/NetworkPolicy):
+
+```bash
+kubectl port-forward -n gophprofile svc/server 8080:80
+curl http://localhost:8080/health
+```
+
+### Сквозной сценарий
+
+```bash
+# 1. Загрузка: multipart-поле image, пользователь — в X-User-ID
+curl -s -X POST http://localhost:8080/api/v1/avatars \
+  -H 'X-User-ID: demo-user' \
+  -F 'image=@/path/to/avatar.png'
+# → 201 {"id":"...","status":"processing",...}
+
+# 2. Метаданные: воркер асинхронно создаёт миниатюры,
+#    processing_status меняется с processing на completed
+curl -s http://localhost:8080/api/v1/avatars/<id>
+
+# 3. Готовая миниатюра (size: original | 100x100 | 300x300)
+curl -s -o /tmp/thumb.png -w '%{http_code}\n' \
+  'http://localhost:8080/api/v1/avatars/<id>/content?size=100x100'
+
+# 4. Удаление (204; оригинал и миниатюры удаляются воркером)
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
+  http://localhost:8080/api/v1/avatars/<id> -H 'X-User-ID: demo-user'
+
+# 5. Пробы
+curl -s http://localhost:8080/live     # {"status":"ok"}
+curl -s http://localhost:8080/health   # 200 или 503 с причиной
+```
+
+Логи и состояние:
+
+```bash
+kubectl logs -n gophprofile deploy/server -f
+kubectl logs -n gophprofile deploy/worker -f
+kubectl get hpa -n gophprofile
+```
 
 ## Kubernetes — Helm
 
@@ -548,7 +670,7 @@ kubectl delete pvc --all -n gophprofile
 ```
 
 Чарт проверен на Helm v3.16.4: `helm lint` и `helm template` проходят для
-дефолтных, dev- и prod-значений (22, 21 и 25 объектов соответственно).
+дефолтных, dev- и prod-значений (23, 22 и 25 объектов соответственно).
 
 ## Kubernetes — мониторинг (ServiceMonitor)
 
@@ -634,12 +756,16 @@ kubectl apply -f k8s/00-namespace.yaml -f k8s/01-secret.yaml -f k8s/02-configmap
 
 | Под | Входящий | Исходящий |
 |---|---|---|
-| `server` | `ingress-nginx` → 8080 | postgres:5432, minio:9000, rabbitmq:5672, DNS (kube-system:53) |
-| `worker` | любой источник → 9091 (метрики) | то же, что у server |
+| `server` | `ingress-nginx` → 8080; `monitoring` → 9090 (метрики) | postgres:5432, minio:9000, rabbitmq:5672, DNS (kube-system:53) |
+| `worker` | `monitoring` → 9091 (метрики) | то же, что у server |
 | `postgres` / `minio` / `rabbitmq` | только от `server` и `worker` | не ограничен (политика задаёт только Ingress) |
 
 DNS разрешён только к `kube-system:53` (UDP и TCP) — внешние резолверы
-приложению не нужны.
+приложению не нужны. Доступ к метрикам открыт только namespace `monitoring`:
+именно оттуда их скрейпит Prometheus Operator. В локальном кластере оператора
+нет, поэтому правило описано «как в проде», но сам скрейп здесь не проверялся;
+если Prometheus установлен в другом namespace, метку в правилах нужно изменить
+(см. `docs/tech-debt.md`).
 
 Проверено на живом кластере (CNI kindnet в minikube v1.39 политики
 **действительно применяет**):
@@ -651,6 +777,13 @@ kubectl run probe --rm -it --image=busybox:1.36 -n default -- \
 # под с меткой app=worker достучится до postgres, но не до server
 kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=worker -- \
   nc -w 3 -z postgres 5432                                  # rc=0 — доступ есть
+# метрики открыты только из namespace monitoring
+kubectl create namespace monitoring
+kubectl run probe --rm -it --image=busybox:1.36 -n monitoring -- \
+  nc -w 3 -z server.gophprofile.svc.cluster.local 9090      # rc=0
+kubectl run probe --rm -it --image=busybox:1.36 -n default -- \
+  nc -w 3 -z server.gophprofile.svc.cluster.local 9090      # rc=1 — отказ
+kubectl delete namespace monitoring
 ```
 
 ### SecurityContext
@@ -680,6 +813,7 @@ kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=work
 
 Три механизма, которые нужны сервису под реальной нагрузкой: устойчивость к
 лежащим зависимостям, защита от лавины запросов и корректное завершение подов.
+Отдельно ниже — порядок применения миграций при деплое.
 
 ### Circuit breaker (S3 и RabbitMQ)
 
@@ -771,6 +905,19 @@ lifecycle:
 как процесс начнёт завершаться — иначе запросы из этого окна рвутся с ошибкой
 соединения. 30 секунд `terminationGracePeriodSeconds` с запасом покрывают
 `preStop` (5s) и догрузку in-flight запросов.
+
+### Миграции при деплое
+
+Схему применяет Helm Job `gophprofile-migrate` — хук
+**`post-install,pre-upgrade`** с тем же образом, что у сервера, и
+`MIGRATE_ONLY=true`. На `install` он выполняется после создания Secret,
+ConfigMap и Service `postgres`; на `upgrade` — до обновления подов приложения.
+Повторный запуск безопасен: goose пропускает уже применённые миграции.
+
+Проверено на кластере: установка, обновление и чистая установка проходят, Job
+завершается успешно, повторный upgrade не применяет миграции заново. Сценарий
+со сменой пароля БД не проверялся: `pre-upgrade` читает Secret предыдущей
+ревизии (см. `docs/tech-debt.md`).
 
 ### Тесты
 

@@ -10,15 +10,15 @@
 #                только к зависимостям и DNS;
 #   * postgres / minio / rabbitmq — снаружи только от server и worker.
 #
+# Метрики (server:9090, worker:9091) открыты только для namespace monitoring:
+# их скрейпит Prometheus Operator (см. 50-servicemonitor.yaml). В локальном
+# стенде оператора нет, поэтому сам скрейп не проверялся, но правило описано
+# так же, как в проде.
+#
 # Чего в политиках НЕТ осознанно:
 #   * отдельного правила «DNS наружу»: приложению нужен только кластерный
 #     резолвер (kube-system:53), внешние DNS ему не нужны — значит, и разрешать
 #     их незачем;
-#   * ingress для server на порт 9090 (метрики): в кластере его скрейпит
-#     Prometheus Operator из namespace monitoring (см. 50-servicemonitor.yaml),
-#     а в локальном стенде оператора нет. В проде сюда добавляется второе
-#     правило `from: namespaceSelector monitoring` — иначе после включения
-#     сегментации метрики сервера окажутся недоступны;
 #   * egress у БД и брокера: политика для них задаёт только Ingress, поэтому
 #     исходящий трафик у них не ограничен. Им нужны ответы на входящие
 #     соединения (они не зависят от egress-правил — ответы идут по уже
@@ -29,9 +29,12 @@
 # действительно фильтруют трафик, а не просто лежат в API. Что наблюдалось:
 #   * под в namespace default → server:8080 — соединение отклонено;
 #   * под в gophprofile без меток app → postgres:5432, minio:9000, rabbitmq:5672
-#     — отклонены, server:8080 — отклонён, worker:9091 — принят;
+#     — отклонены, server:8080 — отклонён;
 #   * под с меткой app=worker → postgres/minio/rabbitmq доступны, server:8080
-#     недоступен (в его ingress-правиле источник — только ingress-nginx).
+#     недоступен (в его ingress-правиле источник — только ingress-nginx);
+#   * server:9090 и worker:9091 — доступны из namespace monitoring и
+#     недоступны из default. Скрейп Prometheus Operator локально не проверялся:
+#     оператора в стенде нет.
 # Ранние версии CNI в kind/minikube NetworkPolicy не реализовывали, поэтому
 # проверку стоит повторять после смены CNI: политика без реализации не даёт
 # ошибки, она просто ничего не делает.
@@ -62,6 +65,14 @@ spec:
               kubernetes.io/metadata.name: ingress-nginx
       ports:
         - port: 8080
+          protocol: TCP
+    # Метрики скрейпит только Prometheus из namespace monitoring.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
           protocol: TCP
   egress:
     - to:
@@ -112,12 +123,13 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # У воркера нет пользовательского трафика: открыт только порт метрик.
-    # Источник не ограничен (`from` не задан) осознанно: в проде метрики
-    # собирает Prometheus из namespace monitoring, а его метки в локальном
-    # стенде неизвестны; перечислить источник — задача прода. Ограничение по
-    # порту при этом сохраняется: ни на что другое воркер не отвечает.
-    - ports:
+    # У воркера нет пользовательского трафика: открыт только порт метрик,
+    # причём только для Prometheus из namespace monitoring.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
         - port: 9091
           protocol: TCP
   egress:
