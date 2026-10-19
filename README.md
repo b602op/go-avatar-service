@@ -10,74 +10,7 @@
 [docs/architecture.md](docs/architecture.md). Спецификация HTTP API —
 [docs/openapi.yaml](docs/openapi.yaml).
 
-## Структура проекта
-
-Проект имеет следующую структуру, основанную на лучших практиках разработки на Go:
-
-```
-/
-├── cmd/                # Точки входа в приложение (main.go)
-│   ├── server/         # HTTP-сервер
-│   └── worker/         # Воркер для асинхронной обработки задач
-├── internal/           # Внутренняя логика приложения
-│   ├── api/            # Спецификации API (OpenAPI/Swagger)
-│   ├── config/         # Конфигурация приложения
-│   ├── domain/         # Основные доменные сущности
-│   ├── handlers/       # HTTP-обработчики
-│   ├── migrator/       # Применение миграций при старте (goose)
-│   ├── repository/     # Работа с хранилищем (БД, S3)
-│   ├── services/       # Бизнес-логика
-│   └── worker/         # Логика воркера
-├── pkg/                # Публичные библиотеки, которые можно использовать в других проектах
-├── web/                # Веб-интерфейс
-│   └── static/         # Статические файлы (HTML, CSS, JS)
-├── migrations/         # SQL-миграции (goose), встраиваются в бинарник
-├── docker/             # Docker-файлы и конфигурации
-├── k8s/                # Манифесты Kubernetes
-├── helm/               # Helm-чарт приложения (упаковка k8s/)
-├── tests/              # Интеграционные и e2e тесты
-├── docs/               # Документация проекта
-└── .gitignore          # Файл для исключения файлов из Git
-```
-
-## Как начать работу
-
-1.  **Клонируйте репозиторий:**
-    ```bash
-    git clone <URL этого репозитория>
-    cd go-avatar-service-template
-    ```
-
-2.  **Инициализируйте свой репозиторий на GitHub:**
-    Следуйте инструкциям GitHub для создания нового репозитория и свяжите его с этим локальным репозиторием.
-
-3.  **Установите зависимости:**
-    ```bash
-    go mod tidy
-    ```
-
-4.  **Настройте окружение:**
-    Создайте файл `.env` на основе `.env.example` (необходимо будет его создать) и укажите необходимые переменные окружения (данные для подключения к БД, S3 и т.д.).
-
-5.  **Запустите сервисы с помощью Docker Compose:**
-    ```bash
-    docker compose -f docker/docker-compose.yml --env-file .env up -d --build --wait
-    ```
-
-После этого сервис будет доступен по адресу `http://localhost:8080`.
-
-## Запуск через Docker
-
-Весь стек (инфраструктура + приложение) поднимается одной командой:
-
-```bash
-make up
-```
-
-Под капотом это `docker compose -f docker/docker-compose.yml --env-file .env up -d --build`.
-Сервис будет доступен на `http://localhost:8080`, веб-интерфейс — на `http://localhost:8080/web/upload`.
-
-## Архитектура
+или просто посмотрите на эту схему
 
 ```mermaid
 flowchart TB
@@ -182,6 +115,74 @@ flowchart TB
     style MigrationJob fill:#8B4513,color:#fff
 ```
 
+## Структура проекта
+
+Проект имеет следующую структуру, основанную на лучших практиках разработки на Go:
+
+```
+/
+├── cmd/                # Точки входа в приложение (main.go)
+│   ├── server/         # HTTP-сервер
+│   └── worker/         # Воркер для асинхронной обработки задач
+├── internal/           # Внутренняя логика приложения
+│   ├── api/            # Спецификации API (OpenAPI/Swagger)
+│   ├── config/         # Конфигурация приложения
+│   ├── domain/         # Основные доменные сущности
+│   ├── handlers/       # HTTP-обработчики
+│   ├── migrator/       # Применение миграций при старте (goose)
+│   ├── repository/     # Работа с хранилищем (БД, S3)
+│   ├── services/       # Бизнес-логика
+│   └── worker/         # Логика воркера
+├── pkg/                # Публичные библиотеки, которые можно использовать в других проектах
+├── web/                # Веб-интерфейс
+│   └── static/         # Статические файлы (HTML, CSS, JS)
+├── migrations/         # SQL-миграции (goose), встраиваются в бинарник
+├── docker/             # Docker-файлы и конфигурации
+├── k8s/                # Манифесты Kubernetes
+├── helm/               # Helm-чарт приложения (упаковка k8s/)
+├── tests/              # Интеграционные и e2e тесты
+├── docs/               # Документация проекта
+└── .gitignore          # Файл для исключения файлов из Git
+```
+
+## Как начать работу
+
+1.  **Клонируйте репозиторий:**
+    ```bash
+    git clone <URL этого репозитория>
+    cd go-avatar-service-template
+    ```
+
+2.  **Инициализируйте свой репозиторий на GitHub:**
+    Следуйте инструкциям GitHub для создания нового репозитория и свяжите его с этим локальным репозиторием.
+
+3.  **Установите зависимости:**
+    ```bash
+    go mod tidy
+    ```
+
+4.  **Настройте окружение:**
+    Создайте файл `.env` на основе `.env.example` (необходимо будет его создать) и укажите необходимые переменные окружения (данные для подключения к БД, S3 и т.д.).
+
+5.  **Запустите сервисы с помощью Docker Compose:**
+    ```bash
+    docker compose -f docker/docker-compose.yml --env-file .env up -d --build --wait
+    ```
+
+После этого сервис будет доступен по адресу `http://localhost:8080`.
+
+## Запуск через Docker
+
+Весь стек (инфраструктура + приложение) поднимается одной командой:
+
+```bash
+make up
+```
+
+Под капотом это `docker compose -f docker/docker-compose.yml --env-file .env up -d --build`.
+Сервис будет доступен на `http://localhost:8080`, веб-интерфейс — на `http://localhost:8080/web/upload`.
+
+
 ### Что поднимается
 
 | Сервис | Контейнер | Порты на хосте | Назначение |
@@ -197,58 +198,6 @@ flowchart TB
 | `loki` | `gophprofile-loki` | 3100 | хранилище логов |
 | `promtail` | `gophprofile-promtail` | — | сбор логов контейнеров через docker-сокет |
 
-
-### Как это работает
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant S as server
-    participant PG as PostgreSQL
-    participant S3 as MinIO/S3
-    participant Q as RabbitMQ
-    participant W as worker
-
-    U->>S: POST /api/v1/avatars (multipart, X-User-ID)
-    S->>S: Validate (magic bytes, size ≤ 10MB)
-    S->>S3: Upload original
-    S->>PG: INSERT avatar (uploaded, pending)
-    S->>Q: Publish avatar.uploaded
-    S-->>U: 201 Created {status: "processing"}
-    
-    Note over Q,W: Асинхронно
-    Q->>W: Consume avatar.uploaded
-    W->>S3: Download original
-    W->>W: Resize to 100x100, 300x300
-    W->>S3: Upload thumbnails
-    W->>PG: UPDATE processing_status=completed, thumbnails, dimensions
-    W->>Q: Ack
-```
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant S as server
-    participant PG as PostgreSQL
-    participant Q as RabbitMQ
-    participant W as worker
-    participant S3 as MinIO/S3
-
-    U->>S: DELETE /api/v1/avatars/{id} (X-User-ID)
-    S->>PG: SELECT avatar (check owner)
-    alt owner mismatch
-        S-->>U: 403 Forbidden
-    else owner ok
-        S->>PG: UPDATE deleted_at = NOW() (soft delete)
-        S->>Q: Publish avatar.deleted (with S3 keys)
-        S-->>U: 204 No Content
-    end
-    
-    Note over Q,W: Асинхронно
-    Q->>W: Consume avatar.deleted
-    W->>S3: RemoveObjects (original + thumbnails)
-    W->>Q: Ack
-```
 
 ### Порядок запуска
 
@@ -269,23 +218,6 @@ SQL-миграции лежат в `migrations/` в формате goose (`-- +g
 Новая миграция — файл `migrations/NNNN_имя.sql` с аннотациями goose; следующий
 запуск приложения применит его сам. Одновременный старт `server` и `worker`
 безопасен: goose берёт session-level advisory lock на время прогона.
-
-### Retry / DLQ
-
-```mermaid
-flowchart TD
-    Handler[worker.Handler] -->|error| Type{Тип ошибки}
-    Type -->|PermanentError<br/>JSON/UUID parse| DLQ[DLQ]
-    Type -->|Transient<br/>retry &lt; 3| RetryQ[Retry Queue<br/>TTL 30s]
-    Type -->|Transient<br/>retry ≥ 3| DLQ
-    RetryQ -->|TTL expired| MainQueue[Main Queue]
-    MainQueue --> Handler
-    DLQ -.->|manual inspection| Ops[Ops]
-    
-    style DLQ fill:#C72C48,color:#fff
-    style RetryQ fill:#FFA500,color:#fff
-    style MainQueue fill:#4A90D9,color:#fff
-```
 
 ### Логика:
 
