@@ -1,0 +1,750 @@
+openapi: 3.0.3
+info:
+  title: GophProfile Avatars API
+  version: 1.0.0
+  description: |
+    HTTP API сервиса «Аватарница»: загрузка, получение и удаление аватарок.
+    Загрузка и удаление асинхронны: миниатюры создаются воркером, поэтому
+    `processing_status` нужно опрашивать до значения `completed`.
+
+    Мутации (`POST`, `DELETE`) требуют заголовок `X-User-ID`: латиница, цифры,
+    `_` и `-`, не длиннее 255 символов. Публичные `GET`-запросы заголовка не
+    требуют.
+  contact:
+    name: NLP-Core-Team
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск (Docker Compose или port-forward)
+  - url: http://gophprofile.local
+    description: Kubernetes Ingress (хост задаётся ingress.host)
+
+tags:
+  - name: Avatars
+    description: Работа с аватарками
+  - name: Users
+    description: Аватарки пользователя
+  - name: Service
+    description: Пробы и состояние сервиса
+
+paths:
+  /api/v1/avatars:
+    post:
+      tags: [Avatars]
+      summary: Загрузить аватарку
+      description: |
+        Принимает `multipart/form-data` с полем `image`. Допустимые форматы —
+        JPEG, PNG, WebP; максимальный размер — 10 МиБ. Оригинал сохраняется в
+        S3, запись создаётся в PostgreSQL, событие `avatar.uploaded` уходит в
+        RabbitMQ. Миниатюры 100x100 и 300x300 создаются асинхронно.
+      operationId: uploadAvatar
+      security:
+        - UserID: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: Файл изображения (JPEG, PNG или WebP), не более 10 МиБ
+      responses:
+        '201':
+          description: Файл принят, обработка поставлена в очередь
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+              example:
+                id: 550e8400-e29b-41d4-a716-446655440000
+                user_id: demo-user
+                url: /api/v1/avatars/550e8400-e29b-41d4-a716-446655440000
+                status: processing
+                created_at: '2026-10-19T12:00:00Z'
+        '400':
+          description: |
+            Некорректный multipart, отсутствует поле `image`, невалидный
+            `X-User-ID` или неподдерживаемый формат файла.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidMultipart:
+                  value:
+                    error: Invalid multipart form
+                missingFile:
+                  value:
+                    error: Missing file
+                    details: Field 'image' is required
+                invalidUserID:
+                  value:
+                    error: invalid X-User-ID
+                invalidFormat:
+                  value:
+                    error: Invalid file format
+                    details: 'Supported formats: jpeg, png, webp'
+        '401':
+          description: Идентификатор пользователя отсутствует в контексте запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Unauthorized
+        '413':
+          description: Файл больше 10 МиБ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileTooLarge'
+              example:
+                error: File too large
+                max_size: 10485760
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /api/v1/avatars/{avatar_id}:
+    get:
+      tags: [Avatars]
+      summary: Получить аватарку по ID
+      operationId: getAvatar
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AvatarID'
+      responses:
+        '200':
+          description: Метаданные аватарки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Avatar'
+        '400':
+          description: Некорректный UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Invalid avatar ID
+        '404':
+          description: Аватарка не найдена или удалена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+    delete:
+      tags: [Avatars]
+      summary: Удалить аватарку
+      description: |
+        Проверяет, что `X-User-ID` совпадает с владельцем, помечает аватар
+        удалённым (soft delete) и публикует `avatar.deleted`. Объекты в S3
+        удаляются асинхронно воркером.
+      operationId: deleteAvatar
+      security:
+        - UserID: []
+      parameters:
+        - $ref: '#/components/parameters/AvatarID'
+      responses:
+        '204':
+          description: Аватар удалён (объекты в S3 удаляются асинхронно)
+        '400':
+          description: Некорректный UUID или невалидный `X-User-ID`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidID:
+                  value:
+                    error: Invalid avatar ID
+                invalidUserID:
+                  value:
+                    error: invalid X-User-ID
+        '401':
+          description: Идентификатор пользователя отсутствует в контексте запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Unauthorized
+        '403':
+          description: Попытка удалить чужой аватар
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Forbidden
+                details: You can only delete your own avatars
+        '404':
+          description: Аватарка не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /api/v1/avatars/{avatar_id}/content:
+    get:
+      tags: [Avatars]
+      summary: Скачать содержимое аватарки
+      description: |
+        Отдаёт оригинал или готовую миниатюру. Ресайза на лету нет: если
+        миниатюра ещё не создана или размер неизвестен, возвращается ошибка.
+        Для готового файла выставляются `Cache-Control: public, max-age=86400`
+        и `ETag`.
+      operationId: getAvatarContent
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AvatarID'
+        - name: size
+          in: query
+          required: false
+          description: 'Размер: оригинал или одна из готовых миниатюр'
+          schema:
+            type: string
+            enum: [original, 100x100, 300x300]
+            default: original
+      responses:
+        '200':
+          description: Байты изображения
+          headers:
+            Content-Type:
+              description: MIME-тип сохранённого файла
+              schema:
+                type: string
+            Content-Length:
+              description: Размер файла в байтах
+              schema:
+                type: integer
+            Cache-Control:
+              description: Политика кэширования
+              schema:
+                type: string
+            ETag:
+              description: Хэш содержимого (если известен)
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Некорректный UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Invalid avatar ID
+        '404':
+          description: Аватарка или запрошенный объект не найдены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '501':
+          description: Неизвестный размер (ресайз на лету не поддерживается)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Not Implemented
+                details: 'available sizes: original, 100x100, 300x300'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /api/v1/avatars/{avatar_id}/metadata:
+    get:
+      tags: [Avatars]
+      summary: Получить метаданные аватарки
+      description: |
+        Дополнительно к `GET /api/v1/avatars/{avatar_id}` отдаёт `dimensions`,
+        когда оригинал уже обработан. Пока размеры неизвестны, поле отсутствует.
+      operationId: getAvatarMetadata
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AvatarID'
+      responses:
+        '200':
+          description: Метаданные аватарки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Metadata'
+        '400':
+          description: Некорректный UUID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Invalid avatar ID
+        '404':
+          description: Аватарка не найдена или удалена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /api/v1/users/{user_id}/avatar:
+    get:
+      tags: [Users]
+      summary: Получить самый свежий аватар пользователя
+      operationId: getUserAvatar
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/UserIDPath'
+      responses:
+        '200':
+          description: Самый свежий аватар пользователя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Avatar'
+        '404':
+          description: У пользователя нет аватарок
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+    delete:
+      tags: [Users]
+      summary: Удалить самый свежий аватар пользователя
+      description: |
+        Проверяет, что `X-User-ID` совпадает с владельцем, помечает аватар
+        удалённым и публикует `avatar.deleted`. Объекты в S3 удаляются
+        асинхронно воркером.
+      operationId: deleteUserAvatar
+      security:
+        - UserID: []
+      parameters:
+        - $ref: '#/components/parameters/UserIDPath'
+      responses:
+        '204':
+          description: Аватар удалён (объекты в S3 удаляются асинхронно)
+        '400':
+          description: Невалидный `X-User-ID`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: invalid X-User-ID
+        '401':
+          description: Идентификатор пользователя отсутствует в контексте запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Unauthorized
+        '403':
+          description: Попытка удалить чужой аватар
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Forbidden
+                details: You can only delete your own avatars
+        '404':
+          description: У пользователя нет аватарок
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Avatar not found
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /api/v1/users/{user_id}/avatars:
+    get:
+      tags: [Users]
+      summary: Список аватарок пользователя
+      description: Возвращает все активные аватарки. Если их нет — пустой массив.
+      operationId: listUserAvatars
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/UserIDPath'
+      responses:
+        '200':
+          description: Список аватарок (может быть пустым)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Avatar'
+        '500':
+          description: Внутренняя ошибка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: Internal Server Error
+
+  /health:
+    get:
+      tags: [Service]
+      summary: Проверка зависимостей (readiness)
+      description: |
+        Проверяет PostgreSQL, S3 и RabbitMQ. `200` — всё в порядке, `503` —
+        хотя бы одна зависимость недоступна. Используется как `readinessProbe`.
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Все зависимости доступны
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                components:
+                  db:
+                    status: ok
+                  s3:
+                    status: ok
+                  broker:
+                    status: ok
+        '503':
+          description: Часть зависимостей или все недоступны
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                degraded:
+                  value:
+                    status: degraded
+                    components:
+                      db:
+                        status: ok
+                      s3:
+                        status: fail
+                        error: context deadline exceeded
+                      broker:
+                        status: ok
+                down:
+                  value:
+                    status: down
+                    components:
+                      db:
+                        status: fail
+                        error: connection refused
+                      s3:
+                        status: fail
+                        error: context deadline exceeded
+                      broker:
+                        status: fail
+                        error: connection closed
+
+  /live:
+    get:
+      tags: [Service]
+      summary: Проверка живости процесса (liveness)
+      description: |
+        Не делает внешних вызовов и всегда отвечает `200`, если процесс жив и
+        обслуживает HTTP. Используется как `livenessProbe`.
+      operationId: getLive
+      security: []
+      responses:
+        '200':
+          description: Процесс жив
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Live'
+              example:
+                status: ok
+
+components:
+  securitySchemes:
+    UserID:
+      type: apiKey
+      in: header
+      name: X-User-ID
+      description: Идентификатор пользователя (латиница, цифры, `_`, `-`, до 255 символов)
+
+  parameters:
+    AvatarID:
+      name: avatar_id
+      in: path
+      required: true
+      description: UUID аватарки
+      schema:
+        type: string
+        format: uuid
+    UserIDPath:
+      name: user_id
+      in: path
+      required: true
+      description: Идентификатор пользователя
+      schema:
+        type: string
+
+  schemas:
+    Avatar:
+      type: object
+      required:
+        - id
+        - user_id
+        - file_name
+        - mime_type
+        - size
+        - url
+        - status
+        - processing_status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+        file_name:
+          type: string
+        mime_type:
+          type: string
+          example: image/png
+        size:
+          type: integer
+          format: int64
+          description: Размер оригинала в байтах
+        url:
+          type: string
+          description: Относительный URL метаданных аватарки
+          example: /api/v1/avatars/550e8400-e29b-41d4-a716-446655440000
+        status:
+          type: string
+          description: Статус загрузки оригинала в S3
+          enum: [uploading, uploaded, failed]
+        processing_status:
+          type: string
+          description: Статус асинхронной обработки
+          enum: [pending, processing, completed, failed]
+        thumbnails:
+          type: array
+          description: Готовые миниатюры; поле отсутствует, пока их нет
+          items:
+            $ref: '#/components/schemas/Thumbnail'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Thumbnail:
+      type: object
+      required: [size, url]
+      properties:
+        size:
+          type: string
+          enum: [100x100, 300x300]
+        url:
+          type: string
+          description: S3-ключ или URL миниатюры
+
+    UploadResponse:
+      type: object
+      required: [id, user_id, url, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+        url:
+          type: string
+        status:
+          type: string
+          enum: [processing]
+        created_at:
+          type: string
+          format: date-time
+
+    Metadata:
+      type: object
+      required:
+        - id
+        - user_id
+        - file_name
+        - mime_type
+        - size
+        - processing_status
+        - thumbnails
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+        file_name:
+          type: string
+        mime_type:
+          type: string
+        size:
+          type: integer
+          format: int64
+        processing_status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        dimensions:
+          $ref: '#/components/schemas/Dimensions'
+        thumbnails:
+          type: array
+          items:
+            $ref: '#/components/schemas/Thumbnail'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Dimensions:
+      type: object
+      required: [width, height]
+      properties:
+        width:
+          type: integer
+          example: 800
+        height:
+          type: integer
+          example: 600
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+
+    FileTooLarge:
+      type: object
+      required: [error, max_size]
+      properties:
+        error:
+          type: string
+          example: File too large
+        max_size:
+          type: integer
+          format: int64
+          description: Максимальный размер файла в байтах
+          example: 10485760
+
+    Health:
+      type: object
+      required: [status, components]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        components:
+          type: object
+          required: [db, s3, broker]
+          properties:
+            db:
+              $ref: '#/components/schemas/ComponentStatus'
+            s3:
+              $ref: '#/components/schemas/ComponentStatus'
+            broker:
+              $ref: '#/components/schemas/ComponentStatus'
+
+    ComponentStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, fail]
+        error:
+          type: string
+          description: Причина отказа; присутствует только при status=fail
+
+    Live:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]

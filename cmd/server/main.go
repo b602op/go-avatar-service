@@ -93,6 +93,12 @@ func run() (err error) {
 		return migrateOnly(signalCtx, cfg, log)
 	}
 
+	// Метрики создаются один раз и передаются всем потребителям: HTTP-серверу,
+	// middleware, сервису и фоновому обновлению storage. Default() ленив и
+	// возвращает тот же набор при повторных вызовах; в тестах вместо него
+	// используют NewMetrics с отдельным реестром.
+	metricsSet := metrics.Default()
+
 	// Трейсинг: OTLP HTTP → Jaeger. Недоступность коллектора не фатальна:
 	// соединение устанавливается лениво, а ошибки экспорта уходят в наш slog
 	// через otel.SetErrorHandler.
@@ -126,7 +132,7 @@ func run() (err error) {
 	// /metrics живёт на отдельном порту: в основной Chi-роутер его не добавляем,
 	// иначе метрики стали бы доступны через публичный API. Падение этого сервера
 	// не должно ронять API — это вспомогательный сигнал, поэтому только логируем.
-	metricsSrv := api.NewMetricsServer(cfg.MetricsAddr, log, false)
+	metricsSrv := api.NewMetricsServer(cfg.MetricsAddr, log, false, metricsSet)
 	go func() {
 		log.Info("metrics server listening", "addr", metricsSrv.Addr)
 		if serveErr := metricsSrv.ListenAndServe(); serveErr != nil &&
@@ -160,11 +166,11 @@ func run() (err error) {
 	defer pool.Close()
 
 	// Метрики пула отдаются вместе с HTTP-метриками на /metrics.
-	metrics.RegisterDBPoolMetrics(pool)
+	metricsSet.RegisterDBPoolMetrics(pool)
 
 	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
 	// Горутина завершается по signalCtx при остановке процесса.
-	go metrics.StartStorageUpdater(signalCtx, pool, log)
+	go metricsSet.StartStorageUpdater(signalCtx, pool, log)
 
 	log.Info("postgres connected")
 
@@ -205,7 +211,7 @@ func run() (err error) {
 
 	// Сборка слоёв: репозиторий → сервис → хендлер → роутер.
 	repo := postgres.NewAvatarRepository(pool)
-	svc := services.NewAvatarService(repo, storage, pub, log)
+	svc := services.NewAvatarService(repo, storage, pub, log, services.WithMetrics(metricsSet))
 	avatarHandler := handlers.NewAvatarHandler(svc, log)
 
 	// /health проверяет все внешние зависимости; собирается здесь, потому что
@@ -219,6 +225,7 @@ func run() (err error) {
 		AllowedOrigins: []string{"*"},
 		RateLimitRPS:   cfg.HTTP.RateLimitRPS,
 		RateLimitBurst: cfg.HTTP.RateLimitBurst,
+		Metrics:        metricsSet,
 	})
 
 	srv := &http.Server{

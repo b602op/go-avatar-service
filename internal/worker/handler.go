@@ -45,14 +45,41 @@ type Handler struct {
 	storage domain.ObjectStorage
 	resizer Resizer
 	log     *slog.Logger
+	metrics *metrics.Metrics
+}
+
+// Option настраивает необязательные зависимости обработчика.
+type Option func(*Handler)
+
+// WithMetrics передаёт обработчику набор метрик. Без этой опции используется
+// metrics.Default(); в тестах так можно изолировать наблюдения в своём реестре.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(h *Handler) {
+		h.metrics = m
+	}
 }
 
 // NewHandler создаёт обработчик событий.
-func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger) *Handler {
+func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger, opts ...Option) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Handler{repo: repo, storage: storage, resizer: rz, log: log}
+
+	h := &Handler{
+		repo:    repo,
+		storage: storage,
+		resizer: rz,
+		log:     log,
+		metrics: metrics.Default(),
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	if h.metrics == nil {
+		h.metrics = metrics.Default()
+	}
+
+	return h
 }
 
 // HandleUpload создаёт миниатюры для загруженной аватарки и сохраняет их в S3.
@@ -68,7 +95,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 	start := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
-			metrics.AvatarsProcessingDuration.WithLabelValues(metrics.StatusPanic).
+			h.metrics.AvatarsProcessingDuration.WithLabelValues(metrics.StatusPanic).
 				Observe(time.Since(start).Seconds())
 			panic(r)
 		}
@@ -77,7 +104,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsProcessingDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+		h.metrics.AvatarsProcessingDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
 	}()
 
 	avatarID, err := uuid.Parse(event.AvatarID)

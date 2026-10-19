@@ -61,6 +61,11 @@ func main() {
 	slog.SetDefault(log)
 	log.Info("starting worker", "config", cfg.String())
 
+	// Метрики создаются один раз и передаются серверу метрик, обработчику и
+	// фоновому обновлению storage. Default() ленив и возвращает тот же набор
+	// при повторных вызовах; в тестах используют NewMetrics с отдельным реестром.
+	metricsSet := metrics.Default()
+
 	// Контекст отменяется по SIGINT/SIGTERM — запускает graceful shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -105,7 +110,7 @@ func main() {
 	// /health здесь же: у воркера нет собственного HTTP-сервера, а healthcheck
 	// контейнера должен что-то опрашивать. В основной Chi-роутер метрики не
 	// добавляем — они не должны быть доступны через публичный API.
-	metricsSrv := api.NewMetricsServer(metricsAddr, log, true)
+	metricsSrv := api.NewMetricsServer(metricsAddr, log, true, metricsSet)
 	go func() {
 		log.Info("metrics server listening", "addr", metricsSrv.Addr)
 		if serveErr := metricsSrv.ListenAndServe(); serveErr != nil &&
@@ -139,11 +144,11 @@ func main() {
 	defer pool.Close()
 
 	// Метрики пула воркера — на его собственном порту метрик (:9091).
-	metrics.RegisterDBPoolMetrics(pool)
+	metricsSet.RegisterDBPoolMetrics(pool)
 
 	// avatars_storage_bytes: первый пересчёт сразу, дальше раз в 30 секунд.
 	// Горутина завершается по ctx при остановке процесса.
-	go metrics.StartStorageUpdater(ctx, pool, log)
+	go metricsSet.StartStorageUpdater(ctx, pool, log)
 
 	log.Info("postgres connected")
 
@@ -171,7 +176,7 @@ func main() {
 
 	// Сборка слоёв: репозиторий → handler → publisher → cleanup → worker.
 	repo := postgres.NewAvatarRepository(pool)
-	handler := worker.NewHandler(repo, storage, worker.ResizerFunc(resizer.ResizeBatch), log)
+	handler := worker.NewHandler(repo, storage, worker.ResizerFunc(resizer.ResizeBatch), log, worker.WithMetrics(metricsSet))
 
 	pub, err := publisher.NewRabbitMQ(cfg.RabbitMQ, log)
 	if err != nil {

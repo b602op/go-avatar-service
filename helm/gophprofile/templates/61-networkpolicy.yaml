@@ -10,13 +10,14 @@
   * worker   — снаружи только порт метрик, наружу только к зависимостям и DNS;
   * postgres / minio / rabbitmq — снаружи только от server и worker.
 
+Метрики (server:9090, worker:9091) открыты только для namespace monitoring:
+их скрейпит Prometheus Operator. В локальном стенде оператора нет, поэтому сам
+скрейп не проверялся; правило описано так же, как в проде и согласовано с
+serviceMonitor.enabled.
+
 Чего в политиках НЕТ осознанно:
   * правила «DNS наружу»: приложению нужен только кластерный резолвер
     (kube-system:53), внешние DNS ему не нужны — значит, и разрешать их незачем;
-  * ingress для server на порт метрик 9090: в проде его скрейпит Prometheus из
-    namespace monitoring, и туда добавляется второе правило `from:
-    namespaceSelector monitoring`. В локальном стенде оператора нет, поэтому
-    правила нет — вместе с serviceMonitor.enabled=false это согласовано;
   * egress у БД и брокера: их политика задаёт только Ingress, поэтому исходящий
     трафик не ограничен. Ответы на входящие соединения идут по уже
     установленным соединениям и egress-правил не требуют.
@@ -24,7 +25,9 @@
 Проверено на локальном стенде (CNI kindnet, minikube v1.39): политики реально
 фильтруют трафик — под из другого namespace не достучался до server:8080, под
 без меток app не достучался до postgres/minio/rabbitmq, а под с меткой
-app=worker — достучался. Протокол проверки — в k8s/61-networkpolicy.yaml.
+app=worker — достучался; порты метрик 9090/9091 открыты только из namespace
+monitoring. Сам скрейп не проверялся: Prometheus Operator в стенде не
+установлен. Протокол проверки — в k8s/61-networkpolicy.yaml.
 */}}
 ---
 # ─── server ─────────────────────────────────────────────────────────────────
@@ -54,6 +57,14 @@ spec:
               kubernetes.io/metadata.name: ingress-nginx
       ports:
         - port: 8080
+          protocol: TCP
+    # Метрики скрейпит только Prometheus из namespace monitoring.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
           protocol: TCP
   egress:
     - to:
@@ -106,12 +117,13 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # У воркера нет пользовательского трафика: открыт только порт метрик.
-    # Источник не ограничен (`from` не задан) осознанно: в проде метрики
-    # собирает Prometheus из namespace monitoring, а в локальном стенде его
-    # метки неизвестны. Ограничение по порту сохраняется: ни на что другое
-    # воркер не отвечает.
-    - ports:
+    # У воркера нет пользовательского трафика: открыт только порт метрик,
+    # причём только для Prometheus из namespace monitoring.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
         - port: 9091
           protocol: TCP
   egress:

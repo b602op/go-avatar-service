@@ -34,6 +34,18 @@ type AvatarService struct {
 	storage   domain.ObjectStorage
 	publisher domain.EventPublisher
 	log       *slog.Logger
+	metrics   *metrics.Metrics
+}
+
+// Option настраивает необязательные зависимости сервиса.
+type Option func(*AvatarService)
+
+// WithMetrics передаёт сервису набор метрик. Без этой опции используется
+// metrics.Default(); в тестах так можно изолировать наблюдения в своём реестре.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(s *AvatarService) {
+		s.metrics = m
+	}
 }
 
 // NewAvatarService создаёт сервис аватарок.
@@ -42,16 +54,27 @@ func NewAvatarService(
 	storage domain.ObjectStorage,
 	publisher domain.EventPublisher,
 	log *slog.Logger,
+	opts ...Option,
 ) *AvatarService {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &AvatarService{
+
+	s := &AvatarService{
 		repo:      repo,
 		storage:   storage,
 		publisher: publisher,
 		log:       log,
+		metrics:   metrics.Default(),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.metrics == nil {
+		s.metrics = metrics.Default()
+	}
+
+	return s
 }
 
 // Upload валидирует изображение, сохраняет оригинал в S3 и создаёт запись в БД.
@@ -79,8 +102,8 @@ func (s *AvatarService) Upload(
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
-		metrics.AvatarsUploadDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+		s.metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
+		s.metrics.AvatarsUploadDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
 	}()
 
 	if err := ValidateImage(data, contentType); err != nil {
@@ -141,7 +164,7 @@ func (s *AvatarService) Upload(
 
 	// Размер наблюдается только у принятого файла: отказы валидации — это про
 	// avatars_uploads_total{status="error"}, а не про распределение размеров.
-	metrics.AvatarsFileSize.Observe(float64(len(data)))
+	s.metrics.AvatarsFileSize.Observe(float64(len(data)))
 
 	s.log.InfoContext(ctx, "avatar uploaded", "avatar_id", avatarID, "user_id", userID)
 	return avatar, nil
@@ -240,7 +263,7 @@ func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID st
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsDeletesTotal.WithLabelValues(status).Inc()
+		s.metrics.AvatarsDeletesTotal.WithLabelValues(status).Inc()
 	}()
 
 	avatar, err := s.repo.GetByID(ctx, id)

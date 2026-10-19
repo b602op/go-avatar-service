@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/metrics"
 )
 
 // requestTimeout — верхняя граница времени обработки одного запроса.
@@ -39,6 +40,8 @@ type RouterDeps struct {
 	// (см. RateLimit). Нулевые значения отключают лимит.
 	RateLimitRPS   float64
 	RateLimitBurst int
+	// Metrics — набор коллекторов процесса. nil означает metrics.Default().
+	Metrics *metrics.Metrics
 }
 
 // NewRouter собирает Chi-роутер с middleware и маршрутами.
@@ -46,6 +49,11 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	log := deps.Log
 	if log == nil {
 		log = slog.Default()
+	}
+
+	metricsSet := deps.Metrics
+	if metricsSet == nil {
+		metricsSet = metrics.Default()
 	}
 
 	r := chi.NewRouter()
@@ -95,7 +103,7 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	r.Use(RateLimit(deps.RateLimitRPS, deps.RateLimitBurst))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
-	r.Use(Metrics())
+	r.Use(Metrics(metricsSet))
 	r.Use(CORS(deps.AllowedOrigins))
 
 	// Публичные маршруты (без X-User-ID).
