@@ -21,23 +21,23 @@ const metricsReadHeaderTimeout = 5 * time.Second
 // withHealth добавляет /health — он нужен воркеру: своего HTTP-сервера у него
 // нет, а healthcheck контейнера должен что-то опрашивать.
 //
-// metricsSet позволяет отдать метрики из конкретного реестра; без аргумента
-// используется metrics.Default().
+// m обязателен: сервер существует ровно для того, чтобы отдать этот набор
+// метрик, поэтому nil — ошибка сборки зависимостей (паника, а не подмена
+// глобальным реестром).
 //
 // log используется как ErrorLog сервера: без этого net/http писал бы свои
 // ошибки в stderr мимо нашего JSON-логгера.
-func NewMetricsServer(addr string, log *slog.Logger, withHealth bool, sets ...*metrics.Metrics) *http.Server {
+func NewMetricsServer(addr string, log *slog.Logger, withHealth bool, m *metrics.Set) *http.Server {
+	if m == nil {
+		panic("api: NewMetricsServer: metrics is nil")
+	}
+
 	if log == nil {
 		log = slog.Default()
 	}
 
-	metricsSet := metrics.Default()
-	if len(sets) > 0 && sets[0] != nil {
-		metricsSet = sets[0]
-	}
-
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metricsSet.Handler())
+	mux.Handle("/metrics", m.Handler())
 	if withHealth {
 		mux.HandleFunc("/health", healthOK)
 	}

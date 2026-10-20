@@ -40,20 +40,21 @@ type RouterDeps struct {
 	// (см. RateLimit). Нулевые значения отключают лимит.
 	RateLimitRPS   float64
 	RateLimitBurst int
-	// Metrics — набор коллекторов процесса. nil означает metrics.Default().
-	Metrics *metrics.Metrics
+	// Metrics — набор коллекторов процесса. Обязателен: без него HTTP-метрики
+	// не считались бы вовсе, а заметить это можно было бы только по пустому
+	// /metrics. nil приводит к панике при сборке роутера.
+	Metrics *metrics.Set
 }
 
 // NewRouter собирает Chi-роутер с middleware и маршрутами.
 func NewRouter(deps RouterDeps) *chi.Mux {
+	if deps.Metrics == nil {
+		panic("api: NewRouter: RouterDeps.Metrics is nil")
+	}
+
 	log := deps.Log
 	if log == nil {
 		log = slog.Default()
-	}
-
-	metricsSet := deps.Metrics
-	if metricsSet == nil {
-		metricsSet = metrics.Default()
 	}
 
 	r := chi.NewRouter()
@@ -103,7 +104,7 @@ func NewRouter(deps RouterDeps) *chi.Mux {
 	r.Use(RateLimit(deps.RateLimitRPS, deps.RateLimitBurst))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
-	r.Use(Metrics(metricsSet))
+	r.Use(Metrics(deps.Metrics))
 	r.Use(CORS(deps.AllowedOrigins))
 
 	// Публичные маршруты (без X-User-ID).

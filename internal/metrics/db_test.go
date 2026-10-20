@@ -59,7 +59,7 @@ func gaugeValue(t *testing.T, gatherer prometheus.Gatherer, name string) float64
 func TestRegisterDBPoolMetrics(t *testing.T) {
 	pool := newLazyPool(t)
 	reg := prometheus.NewRegistry()
-	m := NewMetrics(reg)
+	m := NewSet(reg)
 	m.RegisterDBPoolMetrics(pool)
 
 	// Пул ленивый: соединений ещё нет, поэтому Stat() предсказуем и не меняется

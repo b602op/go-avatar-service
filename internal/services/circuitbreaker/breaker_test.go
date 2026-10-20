@@ -23,7 +23,7 @@ func ok() error { return nil }
 func TestExecute_ReturnsValue(t *testing.T) {
 	cb := New("test")
 
-	got, err := Execute(cb, func() (string, error) { return "payload", nil })
+	got, err := Do(cb, func() (string, error) { return "payload", nil })
 
 	require.NoError(t, err)
 	assert.Equal(t, "payload", got)
@@ -34,7 +34,7 @@ func TestExecute_ReturnsValue(t *testing.T) {
 func TestExecute_PreservesNilValue(t *testing.T) {
 	cb := New("test")
 
-	got, err := Execute(cb, func() (*int, error) { return nil, nil })
+	got, err := Do(cb, func() (*int, error) { return nil, nil })
 
 	require.NoError(t, err)
 	assert.Nil(t, got)
@@ -43,7 +43,7 @@ func TestExecute_PreservesNilValue(t *testing.T) {
 func TestExecute_ReturnsDependencyError(t *testing.T) {
 	cb := New("test")
 
-	_, err := Execute(cb, func() (struct{}, error) { return struct{}{}, errDependency })
+	_, err := Do(cb, func() (struct{}, error) { return struct{}{}, errDependency })
 
 	require.ErrorIs(t, err, errDependency)
 }
@@ -54,18 +54,18 @@ func TestBreaker_OpensAfterConsecutiveFailures(t *testing.T) {
 	// Первые failuresToTrip вызовов выполняются и падают настоящей ошибкой
 	// зависимости: breaker открывается только на последней из них.
 	for i := 0; i < failuresToTrip; i++ {
-		err := ExecuteNoResult(cb, fail)
+		err := cb.ExecuteNoResult(fail)
 		require.ErrorIs(t, err, errDependency, "вызов %d должен дойти до зависимости", i)
 	}
 
 	// Дальше вызовы не выполняются вообще.
-	err := ExecuteNoResult(cb, func() error {
+	err := cb.ExecuteNoResult(func() error {
 		t.Fatal("зависимость не должна вызываться при открытом breaker")
 		return nil
 	})
 
 	require.ErrorIs(t, err, ErrCircuitOpen)
-	assert.Equal(t, gobreaker.StateOpen, cb.State())
+	assert.Equal(t, StateOpen, cb.State())
 }
 
 // Успешный вызов в середине серии сбрасывает счётчик «подряд»: до открытия
@@ -74,14 +74,14 @@ func TestBreaker_SuccessResetsFailureStreak(t *testing.T) {
 	cb := New("test")
 
 	for i := 0; i < failuresToTrip-1; i++ {
-		require.ErrorIs(t, ExecuteNoResult(cb, fail), errDependency)
+		require.ErrorIs(t, cb.ExecuteNoResult(fail), errDependency)
 	}
-	require.NoError(t, ExecuteNoResult(cb, ok))
+	require.NoError(t, cb.ExecuteNoResult(ok))
 	for i := 0; i < failuresToTrip-1; i++ {
-		require.ErrorIs(t, ExecuteNoResult(cb, fail), errDependency)
+		require.ErrorIs(t, cb.ExecuteNoResult(fail), errDependency)
 	}
 
-	assert.Equal(t, gobreaker.StateClosed, cb.State())
+	assert.Equal(t, StateClosed, cb.State())
 }
 
 // Half-open: после таймаута breaker пропускает maxRequests пробных вызовов, и
@@ -91,17 +91,17 @@ func TestBreaker_HalfOpenClosesAfterSuccesses(t *testing.T) {
 	cb := New("test", WithTimeout(time.Millisecond))
 
 	for i := 0; i < failuresToTrip; i++ {
-		require.ErrorIs(t, ExecuteNoResult(cb, fail), errDependency)
+		require.ErrorIs(t, cb.ExecuteNoResult(fail), errDependency)
 	}
-	require.Equal(t, gobreaker.StateOpen, cb.State())
+	require.Equal(t, StateOpen, cb.State())
 
 	time.Sleep(5 * time.Millisecond)
 
 	for i := 0; i < maxRequests; i++ {
-		require.NoError(t, ExecuteNoResult(cb, ok), "пробный вызов %d в half-open", i)
+		require.NoError(t, cb.ExecuteNoResult(ok), "пробный вызов %d в half-open", i)
 	}
 
-	assert.Equal(t, gobreaker.StateClosed, cb.State())
+	assert.Equal(t, StateClosed, cb.State())
 }
 
 // Ошибка из IsExcluded не считается ни успехом, ни неудачей: сколько её ни
@@ -111,10 +111,10 @@ func TestBreaker_ExcludedErrorDoesNotTrip(t *testing.T) {
 	cb := New("test", WithIsExcluded(func(err error) bool { return errors.Is(err, errNotFound) }))
 
 	for i := 0; i < failuresToTrip*2; i++ {
-		require.ErrorIs(t, ExecuteNoResult(cb, func() error { return errNotFound }), errNotFound)
+		require.ErrorIs(t, cb.ExecuteNoResult(func() error { return errNotFound }), errNotFound)
 	}
 
-	assert.Equal(t, gobreaker.StateClosed, cb.State())
+	assert.Equal(t, StateClosed, cb.State())
 }
 
 // Исключённая ошибка не сбрасывает и счётчик реальных неудач: серия сбоев
@@ -124,14 +124,14 @@ func TestBreaker_ExcludedErrorKeepsFailureStreak(t *testing.T) {
 	cb := New("test", WithIsExcluded(func(err error) bool { return errors.Is(err, errNotFound) }))
 
 	for i := 0; i < failuresToTrip-1; i++ {
-		require.ErrorIs(t, ExecuteNoResult(cb, fail), errDependency)
+		require.ErrorIs(t, cb.ExecuteNoResult(fail), errDependency)
 	}
-	require.ErrorIs(t, ExecuteNoResult(cb, func() error { return errNotFound }), errNotFound)
+	require.ErrorIs(t, cb.ExecuteNoResult(func() error { return errNotFound }), errNotFound)
 	// Последняя неудача в серии доводит счётчик до порога и открывает breaker.
-	require.ErrorIs(t, ExecuteNoResult(cb, fail), errDependency)
+	require.ErrorIs(t, cb.ExecuteNoResult(fail), errDependency)
 
-	require.ErrorIs(t, ExecuteNoResult(cb, ok), ErrCircuitOpen)
-	assert.Equal(t, gobreaker.StateOpen, cb.State())
+	require.ErrorIs(t, cb.ExecuteNoResult(ok), ErrCircuitOpen)
+	assert.Equal(t, StateOpen, cb.State())
 }
 
 func TestMapError_PassesThroughForeignErrors(t *testing.T) {

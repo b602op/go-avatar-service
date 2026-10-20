@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/b602op/avatars-service/internal/api"
 	"github.com/b602op/avatars-service/internal/config"
@@ -94,10 +95,9 @@ func run() (err error) {
 	}
 
 	// Метрики создаются один раз и передаются всем потребителям: HTTP-серверу,
-	// middleware, сервису и фоновому обновлению storage. Default() ленив и
-	// возвращает тот же набор при повторных вызовах; в тестах вместо него
-	// используют NewMetrics с отдельным реестром.
-	metricsSet := metrics.Default()
+	// middleware, сервису и фоновому обновлению storage. Реестр — стандартный
+	// для процесса; никаких пакетных «дефолтов» в internal/metrics нет.
+	metricsSet := metrics.NewSet(prometheus.DefaultRegisterer)
 
 	// Трейсинг: OTLP HTTP → Jaeger. Недоступность коллектора не фатальна:
 	// соединение устанавливается лениво, а ошибки экспорта уходят в наш slog
@@ -211,7 +211,7 @@ func run() (err error) {
 
 	// Сборка слоёв: репозиторий → сервис → хендлер → роутер.
 	repo := postgres.NewAvatarRepository(pool)
-	svc := services.NewAvatarService(repo, storage, pub, log, services.WithMetrics(metricsSet))
+	svc := services.NewAvatarService(repo, storage, pub, log, metricsSet)
 	avatarHandler := handlers.NewAvatarHandler(svc, log)
 
 	// /health проверяет все внешние зависимости; собирается здесь, потому что

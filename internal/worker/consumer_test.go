@@ -132,7 +132,7 @@ var (
 
 func TestUploadHandlerFunc_ValidJSON(t *testing.T) {
 	repo := &stubRepo{}
-	h := NewHandler(repo, stubStorage{}, &mockResizer{}, testLogger())
+	h := NewHandler(repo, stubStorage{}, &mockResizer{}, testLogger(), testMetrics())
 
 	avatarID := uuid.New()
 	body, err := json.Marshal(publisher.AvatarUploadEvent{
@@ -149,7 +149,7 @@ func TestUploadHandlerFunc_ValidJSON(t *testing.T) {
 }
 
 func TestUploadHandlerFunc_InvalidJSON(t *testing.T) {
-	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger())
+	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger(), testMetrics())
 
 	err := uploadHandlerFunc(h)(context.Background(), []byte("{not json"))
 	require.Error(t, err)
@@ -157,7 +157,7 @@ func TestUploadHandlerFunc_InvalidJSON(t *testing.T) {
 }
 
 func TestDeleteHandlerFunc_ValidJSON(t *testing.T) {
-	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger())
+	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger(), testMetrics())
 
 	body, err := json.Marshal(publisher.AvatarDeleteEvent{
 		AvatarID: uuid.NewString(),
@@ -170,7 +170,7 @@ func TestDeleteHandlerFunc_ValidJSON(t *testing.T) {
 }
 
 func TestDeleteHandlerFunc_InvalidJSON(t *testing.T) {
-	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger())
+	h := NewHandler(&stubRepo{}, stubStorage{}, &mockResizer{}, testLogger(), testMetrics())
 
 	err := deleteHandlerFunc(h)(context.Background(), []byte("}{"))
 	require.Error(t, err)
@@ -328,7 +328,7 @@ func TestConsumer_ProcessesUploadEvent(t *testing.T) {
 	a := newPendingAvatar(t, env, ctx)
 	uploadOriginal(t, env, ctx, a, makeJPEG(t, 400, 400))
 
-	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), testLogger())
+	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), testLogger(), testMetrics())
 	stop := startConsumer(t, ctx, publisher.QueueAvatarUploaded, publisher.RoutingKeyRetryUploaded, uploadHandlerFunc(h))
 	defer stop()
 
@@ -351,7 +351,7 @@ func TestConsumer_NacksInvalidMessage(t *testing.T) {
 	tp := newTestPublisher(t)
 	ql := queueCounter(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger())
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger(), testMetrics())
 	stop := startConsumer(t, ctx, publisher.QueueAvatarUploaded, publisher.RoutingKeyRetryUploaded, uploadHandlerFunc(h))
 	defer stop()
 
@@ -376,7 +376,7 @@ func TestConsumer_ProcessesDeleteEvent(t *testing.T) {
 		require.NoError(t, env.storage.Upload(ctx, k, bytes.NewReader(data), int64(len(data)), "image/jpeg"))
 	}
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger())
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger(), testMetrics())
 	stop := startConsumer(t, ctx, publisher.QueueAvatarDeleted, publisher.RoutingKeyRetryDeleted, deleteHandlerFunc(h))
 	defer stop()
 

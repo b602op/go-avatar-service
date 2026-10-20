@@ -339,7 +339,7 @@ func (p *RabbitMQPublisher) publish(ctx context.Context, routingKey, messageID s
 	// маршалинга — это ошибка данных, а не деградация брокера, и открывать
 	// breaker на них нельзя: иначе битое событие одного вида «сломает»
 	// публикацию вообще всех событий.
-	err = circuitbreaker.ExecuteNoResult(p.breaker, func() error {
+	err = p.breaker.ExecuteNoResult(func() error {
 		return p.channel.PublishWithContext(ctx, p.exchange, routingKey, false, false, msg)
 	})
 	if err != nil {

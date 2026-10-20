@@ -24,6 +24,7 @@ import (
 	"github.com/disintegration/imaging"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -33,6 +34,7 @@ import (
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
 	"github.com/b602op/avatars-service/internal/handlers"
+	"github.com/b602op/avatars-service/internal/metrics"
 	"github.com/b602op/avatars-service/internal/repository/postgres"
 	"github.com/b602op/avatars-service/internal/services"
 	"github.com/b602op/avatars-service/internal/services/publisher"
@@ -238,11 +240,12 @@ func newEnv(t *testing.T) *env {
 	require.NoError(t, storage.EnsureBucket(ctx))
 
 	repo := postgres.NewAvatarRepository(pool)
-	svc := services.NewAvatarService(repo, storage, stubPublisher{}, testLogger())
+	svc := services.NewAvatarService(repo, storage, stubPublisher{}, testLogger(), testMetrics())
 	router := api.NewRouter(api.RouterDeps{
 		Log:            testLogger(),
 		AvatarHandler:  handlers.NewAvatarHandler(svc, testLogger()),
 		AllowedOrigins: []string{"*"},
+		Metrics:        testMetrics(),
 	})
 
 	server := httptest.NewServer(router)
@@ -266,6 +269,12 @@ func s3Config() config.S3Config {
 // testLogger возвращает логгер, пишущий в никуда.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// testMetrics возвращает набор метрик с отдельным реестром: e2e-тесты не
+// зависят от глобального реестра Prometheus и не мешают друг другу.
+func testMetrics() *metrics.Set {
+	return metrics.NewSet(prometheus.NewRegistry())
 }
 
 // httpResult — результат запроса к приложению: статус, заголовки и тело.
@@ -341,7 +350,7 @@ func (e *env) process(t *testing.T, avatarID string) {
 	avatar, err := e.repo.GetByID(ctx, id)
 	require.NoError(t, err)
 
-	h := worker.NewHandler(e.repo, e.storage, worker.ResizerFunc(resizer.ResizeBatch), testLogger())
+	h := worker.NewHandler(e.repo, e.storage, worker.ResizerFunc(resizer.ResizeBatch), testLogger(), testMetrics())
 	require.NoError(t, h.HandleUpload(ctx, publisher.AvatarUploadEvent{
 		AvatarID: avatarID,
 		UserID:   avatar.UserID,
@@ -386,7 +395,7 @@ func (e *env) processAsync(t *testing.T, avatarID string) {
 			return
 		}
 
-		h := worker.NewHandler(e.repo, e.storage, worker.ResizerFunc(resizer.ResizeBatch), testLogger())
+		h := worker.NewHandler(e.repo, e.storage, worker.ResizerFunc(resizer.ResizeBatch), testLogger(), testMetrics())
 		_ = h.HandleUpload(ctx, publisher.AvatarUploadEvent{
 			AvatarID: avatarID,
 			UserID:   avatar.UserID,

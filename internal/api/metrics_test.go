@@ -16,14 +16,14 @@ import (
 
 // newTestMetrics создаёт изолированный набор метрик: каждый тест пишет в свой
 // реестр и не зависит от порядка выполнения соседних тестов.
-func newTestMetrics(t *testing.T) *metrics.Metrics {
+func newTestMetrics(t *testing.T) *metrics.Set {
 	t.Helper()
-	return metrics.NewMetrics(prometheus.NewRegistry())
+	return metrics.NewSet(prometheus.NewRegistry())
 }
 
 // metricsRouter собирает минимальный Chi-роутер с middleware Metrics.
 // otelhttp здесь не нужен: проверяются метки метрик, а не трейсинг.
-func metricsRouter(m *metrics.Metrics) *chi.Mux {
+func metricsRouter(m *metrics.Set) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(Metrics(m))
 	r.Get("/api/v1/users/{user_id}/avatar", func(w http.ResponseWriter, _ *http.Request) {
@@ -33,7 +33,7 @@ func metricsRouter(m *metrics.Metrics) *chi.Mux {
 }
 
 // requestsTotal читает текущее значение счётчика запросов по меткам.
-func requestsTotal(t *testing.T, m *metrics.Metrics, method, path, status string) float64 {
+func requestsTotal(t *testing.T, m *metrics.Set, method, path, status string) float64 {
 	t.Helper()
 	return testutil.ToFloat64(m.HTTPRequestsTotal.WithLabelValues(method, path, status))
 }

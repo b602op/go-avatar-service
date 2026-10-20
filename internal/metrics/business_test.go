@@ -108,7 +108,7 @@ func TestFileSizeBuckets(t *testing.T) {
 // (кардинальность не должна расти вместе с числом пользователей).
 func TestBusinessMetricsRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m := NewMetrics(reg)
+	m := NewSet(reg)
 
 	// Векторные метрики появляются в выдаче только после первой записи.
 	m.AvatarsUploadsTotal.WithLabelValues(StatusSuccess).Inc()
@@ -164,7 +164,7 @@ func TestBusinessMetricsRegistered(t *testing.T) {
 // счётчик инкрементится, гистограмма накапливает наблюдения.
 func TestBusinessMetricsRecordObservations(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m := NewMetrics(reg)
+	m := NewSet(reg)
 
 	uploads := m.AvatarsUploadsTotal.WithLabelValues(StatusSuccess)
 	// HistogramVec появляется в Gather только после создания серии; без этого
@@ -196,7 +196,7 @@ func TestStartStorageUpdater_StopsOnContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 
-	m := NewMetrics(prometheus.NewRegistry())
+	m := NewSet(prometheus.NewRegistry())
 
 	done := make(chan struct{})
 	go func() {

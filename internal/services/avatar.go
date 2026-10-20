@@ -34,47 +34,36 @@ type AvatarService struct {
 	storage   domain.ObjectStorage
 	publisher domain.EventPublisher
 	log       *slog.Logger
-	metrics   *metrics.Metrics
-}
-
-// Option настраивает необязательные зависимости сервиса.
-type Option func(*AvatarService)
-
-// WithMetrics передаёт сервису набор метрик. Без этой опции используется
-// metrics.Default(); в тестах так можно изолировать наблюдения в своём реестре.
-func WithMetrics(m *metrics.Metrics) Option {
-	return func(s *AvatarService) {
-		s.metrics = m
-	}
+	metrics   *metrics.Set
 }
 
 // NewAvatarService создаёт сервис аватарок.
+//
+// m обязателен: сервис пишет бизнес-метрики на каждой загрузке и удалении, и
+// «молчаливый» fallback на глобальный реестр скрывал бы ошибку сборки
+// зависимостей. nil — ошибка программиста, поэтому паника, а не тихая подмена.
 func NewAvatarService(
 	repo domain.AvatarRepository,
 	storage domain.ObjectStorage,
 	publisher domain.EventPublisher,
 	log *slog.Logger,
-	opts ...Option,
+	m *metrics.Set,
 ) *AvatarService {
+	if m == nil {
+		panic("services: NewAvatarService: metrics is nil")
+	}
+
 	if log == nil {
 		log = slog.Default()
 	}
 
-	s := &AvatarService{
+	return &AvatarService{
 		repo:      repo,
 		storage:   storage,
 		publisher: publisher,
 		log:       log,
-		metrics:   metrics.Default(),
+		metrics:   m,
 	}
-	for _, opt := range opts {
-		opt(s)
-	}
-	if s.metrics == nil {
-		s.metrics = metrics.Default()
-	}
-
-	return s
 }
 
 // Upload валидирует изображение, сохраняет оригинал в S3 и создаёт запись в БД.

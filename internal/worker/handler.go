@@ -45,41 +45,30 @@ type Handler struct {
 	storage domain.ObjectStorage
 	resizer Resizer
 	log     *slog.Logger
-	metrics *metrics.Metrics
-}
-
-// Option настраивает необязательные зависимости обработчика.
-type Option func(*Handler)
-
-// WithMetrics передаёт обработчику набор метрик. Без этой опции используется
-// metrics.Default(); в тестах так можно изолировать наблюдения в своём реестре.
-func WithMetrics(m *metrics.Metrics) Option {
-	return func(h *Handler) {
-		h.metrics = m
-	}
+	metrics *metrics.Set
 }
 
 // NewHandler создаёт обработчик событий.
-func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger, opts ...Option) *Handler {
+//
+// m обязателен: обработчик пишет метрики длительности обработки, и тихий
+// fallback на глобальный реестр скрывал бы забытую зависимость. nil — ошибка
+// программиста, поэтому паника.
+func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger, m *metrics.Set) *Handler {
+	if m == nil {
+		panic("worker: NewHandler: metrics is nil")
+	}
+
 	if log == nil {
 		log = slog.Default()
 	}
 
-	h := &Handler{
+	return &Handler{
 		repo:    repo,
 		storage: storage,
 		resizer: rz,
 		log:     log,
-		metrics: metrics.Default(),
+		metrics: m,
 	}
-	for _, opt := range opts {
-		opt(h)
-	}
-	if h.metrics == nil {
-		h.metrics = metrics.Default()
-	}
-
-	return h
 }
 
 // HandleUpload создаёт миниатюры для загруженной аватарки и сохраняет их в S3.

@@ -27,7 +27,7 @@ const (
 //
 // Метод рассчитан на однократный вызов на процесс: повторная регистрация тех же
 // имён в том же реестре — ошибка программиста (promauto паникует).
-func (m *Metrics) RegisterDBPoolMetrics(pool *pgxpool.Pool) {
+func (m *Set) RegisterDBPoolMetrics(pool *pgxpool.Pool) {
 	// Stat() дёргается на каждый скрейп и каждый раз берёт свежий снимок,
 	// поэтому отдельный кэш или таймер не нужен.
 	stat := pool.Stat

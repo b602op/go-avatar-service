@@ -5,10 +5,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/internal/metrics"
 )
+
+// testMetrics возвращает набор метрик с отдельным реестром: тесты не делят
+// наблюдения друг с другом и не трогают глобальный реестр Prometheus.
+func testMetrics() *metrics.Set {
+	return metrics.NewSet(prometheus.NewRegistry())
+}
 
 // TestWorker_GracefulShutdown проверяет, что Run возвращается при отмене контекста.
 func TestWorker_GracefulShutdown(t *testing.T) {
@@ -17,7 +25,7 @@ func TestWorker_GracefulShutdown(t *testing.T) {
 	// Объявляем очереди (их создаёт паблишер) — иначе consumer'у нечего слушать.
 	newTestPublisher(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger())
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger(), testMetrics())
 	w, err := NewWorker(config.RabbitMQConfig{
 		URL:      rabbitURL,
 		Exchange: testExchange,
@@ -47,7 +55,7 @@ func TestWorker_Close_Idempotent(t *testing.T) {
 	env, _ := setupTest(t)
 	newTestPublisher(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger())
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, testLogger(), testMetrics())
 	w, err := NewWorker(config.RabbitMQConfig{
 		URL:      rabbitURL,
 		Exchange: testExchange,

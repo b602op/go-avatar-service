@@ -45,14 +45,33 @@ const (
 
 // Breaker — circuit breaker для одной внешней зависимости.
 //
-// Параметр типа зафиксирован как any: один breaker обслуживает и операции со
-// значением (Upload возвращает UploadInfo), и операции без него (Delete).
-// Состояние у них должно быть общим — деградирует зависимость, а не отдельный
-// вызов, поэтому отдельные breaker'ы на каждый тип ответа были бы ошибкой.
-type Breaker = gobreaker.CircuitBreaker[any]
+// Тип библиотеки спрятан в приватном поле: наружу не торчит ни
+// gobreaker.CircuitBreaker, ни его ошибки. Иначе вызывающая сторона могла бы
+// дёрнуть cb.Execute напрямую и получить немапленный gobreaker.ErrOpenState
+// мимо ErrCircuitOpen.
+//
+// Параметр типа у поля зафиксирован как any: один breaker обслуживает и
+// операции со значением (Upload возвращает UploadInfo), и операции без него
+// (Delete). Состояние у них должно быть общим — деградирует зависимость, а не
+// отдельный вызов, поэтому отдельные breaker'ы на каждый тип ответа были бы
+// ошибкой.
+type Breaker struct {
+	cb *gobreaker.CircuitBreaker[any]
+}
 
 // Option настраивает breaker до его создания.
-type Option func(*gobreaker.Settings)
+//
+// Своя структура настроек, а не gobreaker.Settings: иначе вызывающий код мог бы
+// переопределить ReadyToTrip или MaxRequests и сломать инварианты пакета, а
+// gobreaker оставался бы в публичном API.
+type Option func(*options)
+
+// options — то, что разрешено менять снаружи.
+type options struct {
+	timeout       time.Duration
+	isExcluded    func(error) bool
+	onStateChange func(name string, from, to State)
+}
 
 // New создаёт breaker с настройками по умолчанию: 5 неудач подряд открывают
 // его на 30 секунд, затем half-open пропускает 3 запроса, и если все три
@@ -62,34 +81,118 @@ type Option func(*gobreaker.Settings)
 // означает именно подряд — серия неудач не размывается по окну. Сбрасывает
 // счётчик только успешный вызов.
 func New(name string, opts ...Option) *Breaker {
+	o := options{timeout: openTimeout}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	settings := gobreaker.Settings{
 		Name:        name,
 		MaxRequests: maxRequests,
 		Interval:    0,
-		Timeout:     openTimeout,
+		Timeout:     o.timeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= failuresToTrip
 		},
 	}
-
-	for _, opt := range opts {
-		opt(&settings)
+	if o.isExcluded != nil {
+		settings.IsExcluded = o.isExcluded
+	}
+	if o.onStateChange != nil {
+		settings.OnStateChange = func(name string, from, to gobreaker.State) {
+			o.onStateChange(name, fromState(from), fromState(to))
+		}
 	}
 
-	return gobreaker.NewCircuitBreaker[any](settings)
+	return &Breaker{cb: gobreaker.NewCircuitBreaker[any](settings)}
+}
+
+// fromState переводит состояние библиотеки в наше.
+func fromState(s gobreaker.State) State {
+	switch s {
+	case gobreaker.StateClosed:
+		return StateClosed
+	case gobreaker.StateHalfOpen:
+		return StateHalfOpen
+	default:
+		return StateOpen
+	}
 }
 
 // Execute выполняет fn через breaker и возвращает её результат.
 //
 // Если breaker открыт, fn не вызывается, а возвращается ErrCircuitOpen.
-func Execute[T any](cb *Breaker, fn func() (T, error)) (T, error) {
+// Результат отдаётся как any: метод не может иметь собственных параметров типа,
+// поэтому типобезопасный вариант — Do.
+func (b *Breaker) Execute(fn func() (any, error)) (any, error) {
+	v, err := b.cb.Execute(fn)
+	if err != nil {
+		return nil, mapError(err)
+	}
+
+	return v, nil
+}
+
+// ExecuteNoResult выполняет fn через breaker, когда результат не нужен
+// (удаление, публикация).
+func (b *Breaker) ExecuteNoResult(fn func() error) error {
+	_, err := b.cb.Execute(func() (any, error) {
+		return nil, fn()
+	})
+	if err != nil {
+		return mapError(err)
+	}
+
+	return nil
+}
+
+// State — состояние breaker, как его видит вызывающая сторона.
+//
+// Свой тип, а не gobreaker.State: состояние библиотеки — тоже деталь
+// реализации, а наружу полезно только «замкнут / полуоткрыт / открыт».
+type State int
+
+const (
+	// StateClosed — вызовы проходят, счётчик неудач ведётся.
+	StateClosed State = iota
+	// StateHalfOpen — пробные вызовы после таймаута.
+	StateHalfOpen
+	// StateOpen — вызовы не выполняются, сразу возвращается ErrCircuitOpen.
+	StateOpen
+)
+
+// String возвращает имя состояния для логов и сообщений тестов.
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateHalfOpen:
+		return "half-open"
+	case StateOpen:
+		return "open"
+	default:
+		return "unknown"
+	}
+}
+
+// State возвращает текущее состояние breaker.
+func (b *Breaker) State() State {
+	return fromState(b.cb.State())
+}
+
+// Do — типобезопасная обёртка над Execute.
+//
+// Отдельная функция, а не метод, потому что у методов в Go не бывает своих
+// параметров типа: без неё вызывающему пришлось бы приводить any к
+// minio.UploadInfo руками и терять nil-значения интерфейсного типа.
+func Do[T any](b *Breaker, fn func() (T, error)) (T, error) {
 	// Результат пишется в захваченную переменную, а не возвращается из
 	// замыкания: значение всё равно пришлось бы приводить из any, а nil-значение
 	// интерфейсного типа при таком приведении терялось бы. Здесь же значение
 	// остаётся в своей типизированной переменной.
 	var result T
 
-	_, err := cb.Execute(func() (any, error) {
+	_, err := b.Execute(func() (any, error) {
 		v, callErr := fn()
 		if callErr == nil {
 			result = v
@@ -100,26 +203,17 @@ func Execute[T any](cb *Breaker, fn func() (T, error)) (T, error) {
 	})
 	if err != nil {
 		var zero T
-		return zero, mapError(err)
+		return zero, err
 	}
 
 	return result, nil
 }
 
-// ExecuteNoResult выполняет fn через breaker, когда результат не нужен
-// (удаление, публикация).
-func ExecuteNoResult(cb *Breaker, fn func() error) error {
-	_, err := Execute(cb, func() (struct{}, error) {
-		return struct{}{}, fn()
-	})
-	return err
-}
-
 // WithTimeout задаёт, сколько breaker остаётся открытым до перехода в half-open.
 // Нужен тестам: ждать 30 секунд в них нельзя.
 func WithTimeout(d time.Duration) Option {
-	return func(s *gobreaker.Settings) {
-		s.Timeout = d
+	return func(o *options) {
+		o.timeout = d
 	}
 }
 
@@ -130,8 +224,8 @@ func WithTimeout(d time.Duration) Option {
 // не сбрасывает счётчик неудач подряд — серия реальных сбоев не маскируется
 // случайным 404 в середине.
 func WithIsExcluded(fn func(error) bool) Option {
-	return func(s *gobreaker.Settings) {
-		s.IsExcluded = fn
+	return func(o *options) {
+		o.isExcluded = fn
 	}
 }
 
@@ -144,9 +238,9 @@ func LogStateChanges(log *slog.Logger) Option {
 		log = slog.Default()
 	}
 
-	return func(s *gobreaker.Settings) {
-		s.OnStateChange = func(name string, from, to gobreaker.State) {
-			if to == gobreaker.StateOpen {
+	return func(o *options) {
+		o.onStateChange = func(name string, from, to State) {
+			if to == StateOpen {
 				log.Warn("circuit breaker opened",
 					"breaker", name,
 					"from", from.String(),

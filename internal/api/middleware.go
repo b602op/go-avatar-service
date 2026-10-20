@@ -31,15 +31,15 @@ var userIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Проверки на этапе компиляции: middleware возвращают стандартную сигнатуру.
 //
-// Metrics проверяется как значение функции, а не вызовом: вызов на этапе
-// инициализации пакета создал бы метрики в реестре по умолчанию раньше, чем
-// main успел бы передать свой набор (и NewMetrics упал бы на дубликате).
+// Все проверки — присваивание самой функции, без вызова: вызов на этапе
+// инициализации пакета создавал бы настоящие объекты (rate.Limiter в RateLimit,
+// коллекторы в Metrics) и тут же их выбрасывал.
 var (
-	_ func(http.Handler) http.Handler                           = RequestLogger(slog.Default())
-	_ func(http.Handler) http.Handler                           = UserID()
-	_ func(http.Handler) http.Handler                           = CORS([]string{"*"})
-	_ func(...*metrics.Metrics) func(http.Handler) http.Handler = Metrics
-	_ func(http.Handler) http.Handler                           = RateLimit(100, 200)
+	_ func(*slog.Logger) func(http.Handler) http.Handler = RequestLogger
+	_ func() func(http.Handler) http.Handler             = UserID
+	_ func([]string) func(http.Handler) http.Handler     = CORS
+	_ func(*metrics.Set) func(http.Handler) http.Handler = Metrics
+	_ func(float64, int) func(http.Handler) http.Handler = RateLimit
 )
 
 // RateLimit ограничивает суммарную частоту HTTP-запросов ко всем маршрутам.
@@ -137,8 +137,10 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 
 // Metrics собирает HTTP-метрики (RED) и отдаёт их в Prometheus.
 //
-// Без аргументов использует metrics.Default(); явно переданный набор позволяет
-// тестам писать в собственный реестр, не смешивая наблюдения.
+// Набор метрик обязателен: middleware — единственное место, где считаются
+// http_requests_total и http_request_duration_seconds, поэтому nil означает
+// ошибку сборки роутера и приводит к панике, а не к тихой подмене глобальным
+// реестром.
 //
 // Регистрируется ПОСЛЕ otelhttp и до CORS: Chi выполняет middleware в порядке
 // объявления, а шаблон маршрута появляется только после матчинга, то есть
@@ -146,10 +148,9 @@ func RequestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 // RoutePattern() внутри Metrics уже заполнен и даёт "/api/v1/avatars/{avatar_id}",
 // а не конкретный URL — кардинальность метки path остаётся на уровне числа
 // маршрутов.
-func Metrics(ms ...*metrics.Metrics) func(http.Handler) http.Handler {
-	m := metrics.Default()
-	if len(ms) > 0 && ms[0] != nil {
-		m = ms[0]
+func Metrics(m *metrics.Set) func(http.Handler) http.Handler {
+	if m == nil {
+		panic("api: Metrics: metrics is nil")
 	}
 
 	return func(next http.Handler) http.Handler {

@@ -168,7 +168,7 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64
 		contentType = defaultContentType
 	}
 
-	_, err = circuitbreaker.Execute(c.breaker, func() (minio.UploadInfo, error) {
+	_, err = circuitbreaker.Do(c.breaker, func() (minio.UploadInfo, error) {
 		return c.mc.PutObject(ctx, c.bucket, key, r, size, minio.PutObjectOptions{
 			ContentType: contentType,
 		})
@@ -203,7 +203,7 @@ func (c *Client) Download(ctx context.Context, key string) (rc io.ReadCloser, in
 	// GetObject ленив: HTTP-запроса при его вызове нет, поэтому в breaker
 	// оборачиваются оба шага — сам GetObject и обязательный Stat, который и
 	// выполняет запрос к хранилищу. Иначе breaker не увидел бы реальных сбоев.
-	dl, err := circuitbreaker.Execute(c.breaker, func() (downloadResult, error) {
+	dl, err := circuitbreaker.Do(c.breaker, func() (downloadResult, error) {
 		obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 		if err != nil {
 			return downloadResult{}, err
@@ -227,7 +227,7 @@ func (c *Client) Download(ctx context.Context, key string) (rc io.ReadCloser, in
 }
 
 // downloadResult — результат успешного Download: поток чтения и метаданные.
-// Нужен как единый тип значения для circuitbreaker.Execute, чтобы открытый
+// Нужен как единый тип значения для circuitbreaker.Do, чтобы открытый
 // breaker не отдавал наружу полупустой результат.
 type downloadResult struct {
 	obj  *minio.Object
@@ -251,7 +251,7 @@ func (c *Client) StatObject(ctx context.Context, key string) (info *domain.Objec
 		span.End()
 	}()
 
-	stat, err := circuitbreaker.Execute(c.breaker, func() (minio.ObjectInfo, error) {
+	stat, err := circuitbreaker.Do(c.breaker, func() (minio.ObjectInfo, error) {
 		return c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
 	})
 	if err != nil {
@@ -283,8 +283,8 @@ func (c *Client) Delete(ctx context.Context, key string) (err error) {
 		span.End()
 	}()
 
-	if _, err = circuitbreaker.Execute(c.breaker, func() (struct{}, error) {
-		return struct{}{}, c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{})
+	if err = c.breaker.ExecuteNoResult(func() error {
+		return c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{})
 	}); err != nil {
 		return fmt.Errorf("s3: delete %q: %w", key, err)
 	}
@@ -329,7 +329,7 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) (err error) {
 	// вызова, а из канала результатов. Поэтому в breaker оборачивается весь
 	// разбор канала, а агрегированная ошибка возвращается наружу как результат —
 	// иначе breaker никогда не увидел бы сбоев batch-удаления.
-	_, err = circuitbreaker.Execute(c.breaker, func() ([]error, error) {
+	_, err = circuitbreaker.Do(c.breaker, func() ([]error, error) {
 		var errs []error
 		for res := range c.mc.RemoveObjects(ctx, c.bucket, objectsCh, minio.RemoveObjectsOptions{}) {
 			c.log.WarnContext(ctx, "s3 batch delete failed", "key", res.ObjectName, "error", res.Err)

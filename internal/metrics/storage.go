@@ -32,7 +32,7 @@ const storageQuery = `SELECT COALESCE(SUM(size_bytes), 0) FROM avatars WHERE del
 //
 // Ошибка запроса не роняет процесс и не обнуляет метрику: в лог уходит Warn,
 // а gauge сохраняет предыдущее значение.
-func (m *Metrics) StartStorageUpdater(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
+func (m *Set) StartStorageUpdater(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
