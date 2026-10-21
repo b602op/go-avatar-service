@@ -38,6 +38,31 @@ spec:
       port: 9090
       targetPort: 9090
 ---
+{{/*
+Headless Service только для сбора метрик.
+
+Обычный Service балансирует: скрейп попадает в случайный под, и серии разных
+реплик склеиваются. Headless (clusterIP: None) отдаёт DNS-имена всех подов,
+поэтому Prometheus со static config (templates/70-prometheus.yaml) скрейпит
+каждую реплику отдельно — как это делает ServiceMonitor через Endpoints.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-metrics
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "server") | nindent 4 }}
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "gophprofile.selectorLabels" (dict "component" "server") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -110,7 +135,7 @@ spec:
             - configMapRef:
                 name: gophprofile-config
             - secretRef:
-                name: gophprofile-secrets
+                name: {{ include "gophprofile.secretName" . }}
           env:
             - name: HTTP_PORT
               value: {{ .Values.server.port | quote }}
@@ -119,28 +144,36 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: gophprofile-secrets
+                  name: {{ include "gophprofile.secretName" . }}
                   key: POSTGRES_USER
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: gophprofile-secrets
+                  name: {{ include "gophprofile.secretName" . }}
                   key: POSTGRES_PASSWORD
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: gophprofile-secrets
+                  name: {{ include "gophprofile.secretName" . }}
                   key: POSTGRES_DB
             - name: S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: gophprofile-secrets
+                  name: {{ include "gophprofile.secretName" . }}
                   key: S3_ACCESS_KEY
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: gophprofile-secrets
+                  name: {{ include "gophprofile.secretName" . }}
                   key: S3_SECRET_KEY
+            # RABBITMQ_URL собирается из логина и пароля, поэтому лежит в Secret,
+            # а не в ConfigMap: иначе пароль брокера был бы виден в описании
+            # ConfigMap и в истории ревизий Helm.
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gophprofile.secretName" . }}
+                  key: RABBITMQ_URL
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
           securityContext:

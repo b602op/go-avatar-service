@@ -39,9 +39,8 @@ data:
   S3_USE_SSL: "false"
 
   # ─── RabbitMQ ───
-  # URL содержит учётные данные: при смене RABBITMQ_DEFAULT_USER/PASS в Secret
-  # это значение нужно поправить синхронно.
-  RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+  # RABBITMQ_URL здесь нет: в нём пароль брокера, а ConfigMap не для секретов.
+  # Ключ лежит в Secret (01-secret.yaml) и подставляется через secretKeyRef.
   RABBITMQ_EXCHANGE: "avatars.exchange"
   # Go-формат duration: config.Load() парсит значение через time.ParseDuration,
   # и «30000» уронило бы старт с ошибкой "must be a valid duration".

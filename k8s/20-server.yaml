@@ -23,8 +23,25 @@ spec:
     - name: http
       port: 80
       targetPort: 8080
-    # Метрики отдельным портом: их будет скрейпить Prometheus (Шаг 3),
+    # Метрики отдельным портом: их скрейпит Prometheus (70-prometheus.yaml),
     # а не пользовательский трафик.
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+# Headless Service только для сбора метрик: DNS отдаёт по A-записи на каждый
+# под, поэтому Prometheus скрейпит все реплики, а не случайную через
+# балансировщик.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-metrics
+  namespace: gophprofile
+spec:
+  clusterIP: None
+  selector:
+    app: server
+  ports:
     - name: metrics
       port: 9090
       targetPort: 9090
@@ -153,6 +170,13 @@ spec:
                 secretKeyRef:
                   name: gophprofile-secrets
                   key: S3_SECRET_KEY
+            # URL брокера содержит пароль, поэтому живёт в Secret, а не в
+            # ConfigMap.
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: RABBITMQ_URL
           resources:
             requests:
               memory: "128Mi"

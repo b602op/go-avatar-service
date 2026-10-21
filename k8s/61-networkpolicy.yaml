@@ -10,10 +10,11 @@
 #                только к зависимостям и DNS;
 #   * postgres / minio / rabbitmq — снаружи только от server и worker.
 #
-# Метрики (server:9090, worker:9091) открыты только для namespace monitoring:
-# их скрейпит Prometheus Operator (см. 50-servicemonitor.yaml). В локальном
-# стенде оператора нет, поэтому сам скрейп не проверялся, но правило описано
-# так же, как в проде.
+# Метрики (server:9090, worker:9091) открыты только источникам сбора:
+#   * поду с меткой app: prometheus — это Prometheus со static config из
+#     70-prometheus.yaml, он живёт в этом же namespace и скрейпит оба порта;
+#   * namespace monitoring — Prometheus Operator из kube-prometheus-stack
+#     (прод-вариант, см. 50-servicemonitor.yaml).
 #
 # Чего в политиках НЕТ осознанно:
 #   * отдельного правила «DNS наружу»: приложению нужен только кластерный
@@ -33,8 +34,8 @@
 #   * под с меткой app=worker → postgres/minio/rabbitmq доступны, server:8080
 #     недоступен (в его ingress-правиле источник — только ingress-nginx);
 #   * server:9090 и worker:9091 — доступны из namespace monitoring и
-#     недоступны из default. Скрейп Prometheus Operator локально не проверялся:
-#     оператора в стенде нет.
+#     недоступны из default; скрейп из пода app=prometheus проверен по факту
+#     (Prometheus → /targets: оба джоба UP, см. README).
 # Ранние версии CNI в kind/minikube NetworkPolicy не реализовывали, поэтому
 # проверку стоит повторять после смены CNI: политика без реализации не даёт
 # ошибки, она просто ничего не делает.
@@ -66,8 +67,12 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
-    # Метрики скрейпит только Prometheus из namespace monitoring.
+    # Метрики: Prometheus со static config (app: prometheus, этот же namespace)
+    # и — в проде — Prometheus Operator из namespace monitoring.
     - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring
@@ -124,8 +129,11 @@ spec:
     - Egress
   ingress:
     # У воркера нет пользовательского трафика: открыт только порт метрик,
-    # причём только для Prometheus из namespace monitoring.
+    # причём только источникам сбора (static Prometheus и оператор).
     - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring

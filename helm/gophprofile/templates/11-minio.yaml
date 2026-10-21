@@ -69,7 +69,7 @@ spec:
           # хранилище заводит при первой инициализации тома.
           envFrom:
             - secretRef:
-                name: gophprofile-secrets
+                name: {{ include "gophprofile.secretName" . }}
           resources:
             {{- toYaml .Values.minio.resources | nindent 12 }}
           securityContext:

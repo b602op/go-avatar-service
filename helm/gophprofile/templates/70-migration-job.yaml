@@ -76,7 +76,7 @@ spec:
             - configMapRef:
                 name: gophprofile-config
             - secretRef:
-                name: gophprofile-secrets
+                name: {{ include "gophprofile.secretName" . }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

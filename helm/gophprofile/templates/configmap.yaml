@@ -3,7 +3,8 @@
 
 Адреса сервисов — короткие DNS-имена внутри namespace: поды ходят друг к другу
 по имени Service и внутреннему порту контейнера, как в compose по именам
-сервисов. Пароли здесь не хранятся — они в Secret (templates/secret.yaml).
+сервисов. Паролей здесь нет вообще — они в Secret (templates/secret.yaml), в
+том числе RABBITMQ_URL, в котором зашит пароль брокера.
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -42,12 +43,10 @@ data:
   S3_USE_SSL: {{ .Values.config.s3UseSSL | quote }}
 
   # ─── RabbitMQ ───
-  # URL собирается из тех же значений, что уходят в Secret: раньше (в k8s/)
-  # логин и пароль были захардкожены здесь отдельно от Secret, и при смене
-  # пароля это место нужно было править синхронно. Значения со спецсимволами
-  # (`@`, `:`, `/`) требуют percent-encoding — для учебного стенда это не
-  # актуально, в проде URL приходит целиком из внешнего секрета.
-  RABBITMQ_URL: {{ printf "amqp://%s:%s@rabbitmq:5672/" .Values.secrets.rabbitmqUser .Values.secrets.rabbitmqPassword | quote }}
+  # RABBITMQ_URL здесь нет: в URL зашит пароль брокера, а ConfigMap не для
+  # секретов (значение видно в `kubectl get configmap -o yaml` и в history
+  # Helm). Ключ RABBITMQ_URL лежит в Secret и подставляется в поды через
+  # env[].valueFrom.secretKeyRef (см. templates/20-server.yaml, 21-worker.yaml).
   RABBITMQ_EXCHANGE: {{ .Values.config.rabbitmqExchange | quote }}
   # Go-формат duration: config.Load() парсит значение через time.ParseDuration,
   # и «30000» уронило бы старт с ошибкой "must be a valid duration".

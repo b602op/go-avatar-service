@@ -1,0 +1,151 @@
+# ─── Prometheus (static config) ─────────────────────────────────────────────
+# Минимальный Prometheus без оператора: Deployment с prometheus.yml из
+# ConfigMap и Service. Нужен, чтобы метрики server:9090 и worker:9091
+# действительно собирались в кластере, а не только отдавались приложением.
+#
+# Почему static config, а не ServiceMonitor: ServiceMonitor — CRD Prometheus
+# Operator, для него нужен kube-prometheus-stack (2-3 GB RAM), который не
+# влезает в ноду minikube вместе с приложением. Здесь достаточно ~100-200 MB.
+# ServiceMonitor (50-servicemonitor.yaml) остаётся артефактом для прода.
+#
+# Ограничения static config (осознанные):
+#   * нет service discovery по меткам: список headless Service'ов фиксирован в
+#     prometheus.yml, новый компонент требует правки ConfigMap;
+#   * нет метки pod: серии различаются по instance (IP:порт), а не по имени пода;
+#   * данные не персистятся (emptyDir, retention 6h) — это стенд для проверки
+#     сбора метрик, а не долговременное хранилище.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: gophprofile
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      # Тот же интервал, что у ServiceMonitor (serviceMonitor.interval).
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Цели — headless Service'ы server-metrics / worker-metrics (см.
+      # 20-server.yaml и 21-worker.yaml): DNS отдаёт по A-записи на каждый под,
+      # поэтому Prometheus скрейпит все реплики отдельно. Ссылка на обычный
+      # Service дала бы одну цель на балансировщик, и серии разных подов
+      # затирали бы друг друга.
+      - job_name: server
+        dns_sd_configs:
+          - names:
+              - server-metrics.gophprofile.svc.cluster.local
+            type: A
+            port: 9090
+      - job_name: worker
+        dns_sd_configs:
+          - names:
+              - worker-metrics.gophprofile.svc.cluster.local
+            type: A
+            port: 9091
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: gophprofile
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        # В Helm-чарте здесь checksum конфига (автоматический рестарт при
+        # правке). В сыром манифесте аннотация статична, поэтому после
+        # изменения prometheus.yml нужен ручной рестарт:
+        #   kubectl rollout restart deployment/prometheus -n gophprofile
+        prometheus.io/config-revision: "1"
+    spec:
+      # Kubernetes API Prometheus не нужен (static config), токен не монтируем.
+      serviceAccountName: gophprofile-sa
+      securityContext:
+        runAsNonRoot: true
+        # Образ prom/prometheus штатно работает от nobody (65534).
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=6h
+            - --web.listen-address=:9090
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+          # /-/ready отвечает 200, когда TSDB загружена и скрейпы пошли;
+          # /-/healthy — только «процесс жив».
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Запись идёт только в /prometheus (emptyDir); конфиг смонтирован
+            # read-only, на корневую ФС писать нечему.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        # emptyDir, а не PVC: метрики стенда не нужно переживать рестарт пода.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: gophprofile
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090

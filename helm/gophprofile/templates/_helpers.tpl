@@ -34,6 +34,18 @@ namespace — куда ставить объекты. Приоритет у glob
 {{- default .Release.Namespace .Values.global.namespace -}}
 {{- end -}}
 
+{{/*
+secretName — имя Secret с учётными данными.
+
+Если задан secrets.existingSecret, чарт Secret не создаёт (templates/secret.yaml
+под этим условием) и все потребители ссылаются на внешний объект: так значения
+не попадают ни в values.yaml, ни в историю ревизий Helm. Пустое значение —
+локальный стенд, Secret создаётся чартом.
+*/}}
+{{- define "gophprofile.secretName" -}}
+{{- default "gophprofile-secrets" .Values.secrets.existingSecret -}}
+{{- end -}}
+
 {{/* Общие метки: что это за чарт, какая версия, кто управляет объектом. */}}
 {{- define "gophprofile.labels" -}}
 app.kubernetes.io/name: {{ include "gophprofile.name" . }}

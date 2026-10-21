@@ -124,12 +124,34 @@ serviceMonitor:
   # ServiceMonitor'ы: по умолчанию это имя helm-релиза стека.
   releaseLabel: kube-prometheus-stack
 
+prometheus:
+  # Prometheus со static config (ConfigMap + Deployment + Service): собирает
+  # метрики server:9090 и worker:9091 без оператора. true по умолчанию — так
+  # работает локальный стенд. В проде обычно false: сбор идёт через
+  # ServiceMonitor, а Prometheus приходит из kube-prometheus-stack.
+  enabled: true
+  image:
+    repository: prom/prometheus
+    tag: v2.54.1
+  # Совпадает с serviceMonitor.interval: один интервал на оба способа сбора.
+  scrapeInterval: 15s
+  # Данные лежат в emptyDir — retention ограничивает потребление памяти/диска.
+  retention: 6h
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+
 migration:
   # Helm-хук с миграциями (templates/70-migration-job.yaml). Отключается, если
   # схемой управляет внешний инструмент (например, отдельный pipeline).
   enabled: true
   backoffLimit: 3
 
+# Несекретная конфигурация (ConfigMap).
 config:
   appEnv: local
   logLevel: info
@@ -143,10 +165,18 @@ config:
   rabbitmqExchange: avatars.exchange
   rabbitmqRetryTTL: "30s"
 
-# Учётные данные для учебного стенда: подставляются в Secret и в ConfigMap
-# (RABBITMQ_URL). В проде значения должны приходить из внешнего хранилища
-# секретов, а не из values.yaml — см. docs/tech-debt.md.
+# Учётные данные. Для локального стенда чарт создаёт Secret из значений ниже;
+# для прода — внешний Secret:
+#   --set secrets.existingSecret=my-secret
+# тогда чарт Secret не создаёт, а server, worker, Job миграций и инфраструктура
+# читают существующий объект. Контракт внешнего Secret — те же ключи, что
+# создаёт templates/secret.yaml:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+#   MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY,
+#   RABBITMQ_DEFAULT_USER, RABBITMQ_DEFAULT_PASS, RABBITMQ_URL
+# Пароли ниже — только для стенда: с existingSecret они не используются.
 secrets:
+  existingSecret: ""
   postgresUser: avatar
   postgresPassword: avatar
   postgresDb: avatars

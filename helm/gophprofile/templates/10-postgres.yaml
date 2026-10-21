@@ -69,7 +69,7 @@ spec:
           # создаёт пользователя и базу при первой инициализации тома.
           envFrom:
             - secretRef:
-                name: gophprofile-secrets
+                name: {{ include "gophprofile.secretName" . }}
           env:
             # Данные в подкаталоге pgdata, а не в корне тома: на томе может
             # лежать lost+found, из-за которого initdb отказывается работать.

@@ -74,10 +74,11 @@ spec:
             - containerPort: 15692
           # RABBITMQ_DEFAULT_USER / RABBITMQ_DEFAULT_PASS: брокер создаёт этого
           # пользователя при первой инициализации тома. Под ним же ходит
-          # приложение (RABBITMQ_URL в ConfigMap собирается из этих значений).
+          # приложение: RABBITMQ_URL лежит в том же Secret и подставляется
+          # в поды через secretKeyRef.
           envFrom:
             - secretRef:
-                name: gophprofile-secrets
+                name: {{ include "gophprofile.secretName" . }}
           resources:
             {{- toYaml .Values.rabbitmq.resources | nindent 12 }}
           securityContext:

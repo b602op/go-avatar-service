@@ -3,6 +3,12 @@
 #   helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
 #     -f helm/gophprofile/values-prod.yaml
 
+secrets:
+  # Чарт не создаёт Secret и не хранит пароли в values: все компоненты читают
+  # существующий объект. Имя — то, что создаёт ваш pipeline (External Secrets,
+  # SOPS, Vault). Контракт ключей описан в values.yaml.
+  existingSecret: gophprofile-secrets-external
+
 server:
   # Стартовое число подов; дальше им управляет HPA (minReplicas ниже).
   replicas: 3
@@ -22,6 +28,11 @@ hpa:
 # Включается после установки kube-prometheus-stack (см. README).
 serviceMonitor:
   enabled: true
+
+# В проде метрики собирает kube-prometheus-stack через ServiceMonitor,
+# поэтому встроенный Prometheus со static config не нужен.
+prometheus:
+  enabled: false
 
 ingress:
   host: avatars.example.com

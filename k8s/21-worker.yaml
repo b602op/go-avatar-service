@@ -22,6 +22,22 @@ spec:
       port: 9091
       targetPort: 9091
 ---
+# Headless Service только для сбора метрик: DNS отдаёт по A-записи на каждый
+# под (см. 20-server.yaml и 70-prometheus.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-metrics
+  namespace: gophprofile
+spec:
+  clusterIP: None
+  selector:
+    app: worker
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -108,6 +124,13 @@ spec:
                 secretKeyRef:
                   name: gophprofile-secrets
                   key: S3_SECRET_KEY
+            # URL брокера содержит пароль, поэтому живёт в Secret, а не в
+            # ConfigMap.
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: RABBITMQ_URL
           resources:
             requests:
               memory: "128Mi"
