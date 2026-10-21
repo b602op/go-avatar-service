@@ -54,13 +54,15 @@ flowchart TB
 
         subgraph Observability["Наблюдаемость"]
             Metrics["📊 /metrics :9090/:9091"]
+            Headless["🔗 Headless-сервисы<br/>server-metrics / worker-metrics"]
+            PromInK8s["🔥 Prometheus<br/>(static config, стенд)"]
             ServiceMonitor["📡 ServiceMonitor<br/>(артефакт, CRD нет)"]
             Logs["📋 JSON logs + trace_id<br/>(Loki)"]
         end
     end
 
     subgraph ExternalObs["Внешняя наблюдаемость (в проде)"]
-        Prometheus["🔥 Prometheus"]
+        Prometheus["🔥 Prometheus Operator"]
         Jaeger["🔍 Jaeger"]
         Grafana["📈 Grafana"]
     end
@@ -94,11 +96,13 @@ flowchart TB
     
     ServerPod1 -->|"отдаёт"| Metrics
     WorkerPod -->|"отдаёт"| Metrics
-    ServiceMonitor -.->|"scrape"| Metrics
+    Metrics --> Headless
+    Headless -->|"dns_sd"| PromInK8s
+    ServiceMonitor -.->|"scrape (в проде)"| Metrics
     ServerPod1 -->|"logs"| Logs
     WorkerPod -->|"logs"| Logs
     
-    Metrics -.->|"в проде"| Prometheus
+    PromInK8s -.->|"в проде заменяется"| Prometheus
     Logs -.->|"в проде"| Grafana
     Prometheus -.-> Grafana
 
@@ -113,6 +117,7 @@ flowchart TB
     style NetPol fill:#2E8B57,color:#fff
     style HelmChart fill:#326CE5,color:#fff
     style MigrationJob fill:#8B4513,color:#fff
+    style PromInK8s fill:#E6522C,color:#fff
 ```
 
 ## Структура проекта
@@ -307,9 +312,10 @@ Prometheus слушает **9092**, а не 9090: порт 9090 на хосте 
 
 В Kubernetes эти же сигналы сохраняются: метрики отдаются на `:9090` (server) и
 `:9091` (worker), трейсы уходят по OTLP на Jaeger, логи остаются JSON с
-`trace_id`. Обнаружение метрик в кластере — через ServiceMonitor, для которого
-нужен Prometheus Operator; подробности и ограничения локального стенда — в
-разделе «Kubernetes — мониторинг (ServiceMonitor)».
+`trace_id`. В локальном кластере метрики собирает Prometheus из чарта
+(`prometheus.enabled: true`) через headless-сервисы `server-metrics` и
+`worker-metrics`; в проде тот же сбор описывают ServiceMonitor'ы для
+Prometheus Operator. Подробности — в разделе «Kubernetes — мониторинг».
 
 ### Трейсинг (Jaeger)
 
@@ -438,10 +444,35 @@ helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace
 ```
 
 Чарт создаёт PostgreSQL, MinIO, RabbitMQ, Deployment'ы `server` и `worker`,
-Service'ы, Ingress, HPA, ServiceAccount'ы и NetworkPolicy. Job миграций —
-`post-install` хук: он запускается после создания объектов релиза, применяет
-схему и удаляется после успеха (`hook-delete-policy: hook-succeeded`), поэтому
-в `kubectl get jobs` его обычно уже нет.
+Service'ы, Ingress, HPA, ServiceAccount'ы, NetworkPolicy и Prometheus для
+локального сбора метрик. Job миграций — `post-install` хук: он запускается
+после создания объектов релиза, применяет схему и удаляется после успеха
+(`hook-delete-policy: hook-succeeded`), поэтому в `kubectl get jobs` его обычно
+уже нет.
+
+Учётные данные по умолчанию берутся из `secrets.*` в `values.yaml`, и чарт
+создаёт из них Secret `gophprofile-secrets`. Чтобы Secret'ом управлял не Helm,
+а внешняя система (Vault, External Secrets, SOPS), задайте его имя:
+
+```bash
+helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
+  --set secrets.existingSecret=gophprofile-secrets-external
+```
+
+В этом режиме `templates/secret.yaml` не рендерится, а все потребители
+(`server`, `worker`, Job миграций, PostgreSQL, MinIO, RabbitMQ) ссылаются на
+существующий объект через helper `gophprofile.secretName`. Контракт внешнего
+Secret — 10 ключей: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
+`MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`,
+`RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `RABBITMQ_URL`. Последний
+ключ обязателен: при внешнем Secret пароль брокера не читается из values,
+поэтому URL `amqp://...` приходит только из Secret. В `values-prod.yaml`
+`secrets.existingSecret` уже включён.
+
+Смена режима Secret на уже установленном релизе требует `--no-hooks`:
+`pre-upgrade` хук миграций выполняется до применения объектов новой ревизии и
+читает Secret предыдущей, поэтому при переходе «чарт → внешний Secret» Job
+падает с `CreateContainerConfigError` (см. `docs/tech-debt.md`).
 
 Проверка:
 
@@ -516,7 +547,9 @@ kubectl get hpa -n gophprofile
 манифестами (сами манифесты оставлены для сравнения и для отладки без Helm).
 Namespace в чарт не входит — используется `--create-namespace`; ServiceMonitor
 по умолчанию выключен (`serviceMonitor.enabled: false`), потому что в локальном
-кластере нет CRD Prometheus Operator.
+кластере нет CRD Prometheus Operator. Вместо него метрики собирает встроенный
+Prometheus со static config (`prometheus.enabled: true`) — см. раздел
+«Kubernetes — мониторинг».
 
 ```bash
 # Установка: создаёт объекты, затем выполняет хук миграций
@@ -529,7 +562,7 @@ helm upgrade gophprofile ./helm/gophprofile -n gophprofile
 helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
   -f helm/gophprofile/values-dev.yaml     # 1 под сервера, без HPA
 helm upgrade gophprofile ./helm/gophprofile -n gophprofile \
-  -f helm/gophprofile/values-prod.yaml    # 3 пода, HPA до 20, ServiceMonitor, внешний домен
+  -f helm/gophprofile/values-prod.yaml    # 3 пода, HPA до 20, ServiceMonitor, внешний Secret, внешний домен
 
 # Удаление (PVC при этом остаются — см. ниже)
 helm uninstall gophprofile -n gophprofile
@@ -544,20 +577,21 @@ helm list -n gophprofile
 
 | Шаблон | Объекты |
 |---|---|
-| `secret.yaml`, `configmap.yaml` | учётные данные и несекретная конфигурация |
+| `secret.yaml`, `configmap.yaml` | учётные данные и несекретная конфигурация; при `secrets.existingSecret` Secret не создаётся |
 | `10-postgres.yaml`, `11-minio.yaml`, `12-rabbitmq.yaml` | StatefulSet + headless Service + PVC |
-| `20-server.yaml`, `21-worker.yaml` | Deployment + Service |
+| `20-server.yaml`, `21-worker.yaml` | Deployment + Service + headless Service для метрик (`*-metrics`) |
 | `30-ingress.yaml` | Ingress (гасится `ingress.enabled`) |
 | `40-hpa.yaml` | HPA (гасится `hpa.enabled`) |
 | `50-servicemonitor.yaml` | ServiceMonitor'ы (`serviceMonitor.enabled`, по умолчанию `false`) |
 | `60-serviceaccount.yaml`, `61-networkpolicy.yaml` | ServiceAccount'ы и сетевая сегментация |
 | `70-migration-job.yaml` | Job миграций (Helm-хук) |
+| `70-prometheus.yaml` | Prometheus со static config (`prometheus.enabled`, по умолчанию `true`) |
 
 Основные ручки — в `values.yaml`: образы и число реплик (`server`, `worker`),
 ресурсы и размеры томов (`postgres`, `minio`, `rabbitmq`), `ingress.*`,
-`hpa.*`, `serviceMonitor.*`, `config.*` и `secrets.*`. Имена объектов
-(`server`, `postgres`, `gophprofile-secrets`, …) зафиксированы, а не собраны из
-имени релиза: на них ссылаются переменные окружения приложения
+`hpa.*`, `serviceMonitor.*`, `prometheus.*`, `config.*` и `secrets.*`. Имена
+объектов (`server`, `postgres`, `gophprofile-secrets`, …) зафиксированы, а не
+собраны из имени релиза: на них ссылаются переменные окружения приложения
 (`POSTGRES_HOST=postgres`, `S3_ENDPOINT=minio:9000`) и селекторы NetworkPolicy,
 поэтому чарт рассчитан на один релиз в namespace.
 
@@ -602,18 +636,71 @@ kubectl delete pvc --all -n gophprofile
 ```
 
 Чарт проверен на Helm v3.16.4: `helm lint` и `helm template` проходят для
-дефолтных, dev- и prod-значений (23, 22 и 25 объектов соответственно).
+дефолтных, dev- и prod-значений (28, 27 и 26 объектов соответственно).
 
-## Kubernetes — мониторинг (ServiceMonitor)
+## Kubernetes — мониторинг
+
+Метрики в кластере собираются двумя способами, и они не конфликтуют:
+встроенный Prometheus со static config работает на локальном стенде, а
+ServiceMonitor описывает тот же сбор для Prometheus Operator в проде.
+
+### Prometheus на локальном стенде
+
+`k8s/70-prometheus.yaml` и `templates/70-prometheus.yaml` создают ConfigMap
+`prometheus-config`, Deployment `prometheus` (образ `prom/prometheus:v2.54.1`)
+и Service `prometheus:9090`. В чарте это включается `prometheus.enabled: true`
+(значение по умолчанию), в `values-prod.yaml` — выключено, потому что там
+Prometheus приходит из `kube-prometheus-stack`.
+
+Зачем свой Prometheus: ServiceMonitor — это CRD, которых в minikube нет, а
+полный `kube-prometheus-stack` требует 2–3 GB RAM (у ноды 6 GB, из которых
+~1.5 GB занимают приложение и инфраструктура). Встроенный Prometheus обходится
+без оператора: `dns_sd_configs` — штатная возможность самого Prometheus.
+
+Цели — **headless** Service'ы `server-metrics:9090` и `worker-metrics:9091`
+(`clusterIP: None`, добавлены в `20-server.yaml` и `21-worker.yaml` рядом с
+обычными Service'ами). Headless-сервис отдаёт A-записи на каждый под, поэтому
+Prometheus скрейпит каждую реплику отдельно. Ссылка на обычный Service дала бы
+одну цель на балансировщик: скрейпы попадали бы в случайный под, и
+бизнес-метрики одного пода затирались бы нулями другого — на двух репликах
+`server` это воспроизводилось.
+
+```bash
+# targets и их состояние
+kubectl -n gophprofile port-forward svc/prometheus 9092:9090
+curl -s http://localhost:9092/api/v1/targets \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(t["labels"]["job"], t["scrapeUrl"], t["health"]) for t in d["data"]["activeTargets"]]'
+
+# бизнес-метрики
+curl -s 'http://localhost:9092/api/v1/query?query=avatars_storage_bytes'
+```
+
+Проверено на живом кластере: три цели (`server` ×2, `worker` ×1) в состоянии
+`up`, `up == 1` для всех, `http_requests_total` содержит серии обоих подов
+сервера, `avatars_uploads_total{status="success"}` и `avatars_storage_bytes`
+отдаются. Порт 9092 выбран для port-forward, чтобы не конфликтовать с
+локальным `/metrics` сервера на 9090.
+
+Ограничения по сравнению с ServiceMonitor (осознанные):
+
+- список целей фиксирован в `prometheus.yml` — новый компонент требует правки
+  ConfigMap (в Helm-шаблоне есть `checksum/prometheus-config`, поэтому правка
+  сама вызывает рестарт пода; в `k8s/` нужен `kubectl rollout restart`);
+- нет метки `pod`: серии различаются по `instance` (IP:порт), а не по имени
+  пода;
+- данные не персистятся: `emptyDir`, retention 6 часов — это стенд для
+  проверки сбора, а не долговременное хранилище;
+- NetworkPolicy пускает к метрикам только namespace `monitoring` и поды с
+  меткой `app: prometheus` — см. раздел про безопасность.
+
+### ServiceMonitor (прод)
 
 `k8s/50-servicemonitor.yaml` — **артефакт для Prometheus Operator**, в локальном
 кластере он не применяется. В Helm-чарте тот же объект выключен по умолчанию
 (`serviceMonitor.enabled: false`) и включается в проде — см. раздел
 «Kubernetes — Helm». Манифест описан в терминах CRD
-`monitoring.coreos.com/v1`, которых в minikube нет: полный
-`kube-prometheus-stack` требует 2–3 GB RAM, а у ноды 6 GB, из которых ~1.5 GB
-занимают приложение и инфраструктура. Поэтому файл лежит в репозитории как
-готовый к продакшену объект (для ревьюера), а не как часть рабочего стенда.
+`monitoring.coreos.com/v1`, которых в minikube нет, поэтому файл лежит в
+репозитории как готовый к продакшену объект, а не как часть рабочего стенда.
 
 В проде:
 
@@ -649,8 +736,8 @@ Prometheus.
   `release`, равной имени helm-релиза. Если релиз назван иначе — поправить.
 
 Метрики (добавлены в iter2) отдаются на `/metrics`: `:9090` у server,
-`:9091` у worker — те же, что собираются в Docker-стенде. Пока оператора нет,
-в локальном кластере метрики снимаются вручную:
+`:9091` у worker — те же, что собираются в Docker-стенде. В локальном кластере
+их собирает встроенный Prometheus (раздел выше), а снять вручную можно так:
 
 ```bash
 kubectl port-forward -n gophprofile svc/server 9090:9090
@@ -666,7 +753,8 @@ Prometheus Operator):
 kubectl apply -f k8s/00-namespace.yaml -f k8s/01-secret.yaml -f k8s/02-configmap.yaml \
   -f k8s/10-postgres.yaml -f k8s/11-minio.yaml -f k8s/12-rabbitmq.yaml \
   -f k8s/20-server.yaml -f k8s/21-worker.yaml -f k8s/30-ingress.yaml \
-  -f k8s/40-hpa.yaml -f k8s/60-serviceaccount.yaml -f k8s/61-networkpolicy.yaml
+  -f k8s/40-hpa.yaml -f k8s/60-serviceaccount.yaml -f k8s/61-networkpolicy.yaml \
+  -f k8s/70-prometheus.yaml
 ```
 
 Тот же набор объектов ставится одной командой через Helm — см. раздел
@@ -688,16 +776,16 @@ kubectl apply -f k8s/00-namespace.yaml -f k8s/01-secret.yaml -f k8s/02-configmap
 
 | Под | Входящий | Исходящий |
 |---|---|---|
-| `server` | `ingress-nginx` → 8080; `monitoring` → 9090 (метрики) | postgres:5432, minio:9000, rabbitmq:5672, DNS (kube-system:53) |
-| `worker` | `monitoring` → 9091 (метрики) | то же, что у server |
+| `server` | `ingress-nginx` → 8080; `app: prometheus` и `monitoring` → 9090 (метрики) | postgres:5432, minio:9000, rabbitmq:5672, DNS (kube-system:53) |
+| `worker` | `app: prometheus` и `monitoring` → 9091 (метрики) | то же, что у server |
 | `postgres` / `minio` / `rabbitmq` | только от `server` и `worker` | не ограничен (политика задаёт только Ingress) |
 
 DNS разрешён только к `kube-system:53` (UDP и TCP) — внешние резолверы
-приложению не нужны. Доступ к метрикам открыт только namespace `monitoring`:
-именно оттуда их скрейпит Prometheus Operator. В локальном кластере оператора
-нет, поэтому правило описано «как в проде», но сам скрейп здесь не проверялся;
-если Prometheus установлен в другом namespace, метку в правилах нужно изменить
-(см. `docs/tech-debt.md`).
+приложению не нужны. Доступ к метрикам открыт namespace `monitoring` и подам с
+меткой `app: prometheus`: первый — Prometheus Operator в проде, второй —
+встроенный Prometheus локального стенда (он живёт в том же namespace, и
+`namespaceSelector` его бы не пропустил). Если Prometheus установлен в другом
+namespace или с другой меткой, правила нужно изменить (см. `docs/tech-debt.md`).
 
 Проверено на живом кластере (CNI kindnet в minikube v1.39 политики
 **действительно применяет**):
@@ -709,12 +797,14 @@ kubectl run probe --rm -it --image=busybox:1.36 -n default -- \
 # под с меткой app=worker достучится до postgres, но не до server
 kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=worker -- \
   nc -w 3 -z postgres 5432                                  # rc=0 — доступ есть
-# метрики открыты только из namespace monitoring
+# метрики открыты только из namespace monitoring и подам app=prometheus
 kubectl create namespace monitoring
 kubectl run probe --rm -it --image=busybox:1.36 -n monitoring -- \
   nc -w 3 -z server.gophprofile.svc.cluster.local 9090      # rc=0
-kubectl run probe --rm -it --image=busybox:1.36 -n default -- \
-  nc -w 3 -z server.gophprofile.svc.cluster.local 9090      # rc=1 — отказ
+kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile -- \
+  nc -w 3 -z server-metrics.gophprofile.svc.cluster.local 9090  # rc=1 — отказ
+kubectl run probe --rm -it --image=busybox:1.36 -n gophprofile --labels=app=prometheus -- \
+  nc -w 3 -z server-metrics.gophprofile.svc.cluster.local 9090  # rc=0
 kubectl delete namespace monitoring
 ```
 
@@ -849,7 +939,8 @@ ConfigMap и Service `postgres`; на `upgrade` — до обновления п
 Проверено на кластере: установка, обновление и чистая установка проходят, Job
 завершается успешно, повторный upgrade не применяет миграции заново. Сценарий
 со сменой пароля БД не проверялся: `pre-upgrade` читает Secret предыдущей
-ревизии (см. `docs/tech-debt.md`).
+ревизии. По той же причине переход на `secrets.existingSecret` на живом
+релизе делается с `--no-hooks` (см. `docs/tech-debt.md`).
 
 ### Тесты
 

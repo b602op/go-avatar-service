@@ -17,6 +17,8 @@ flowchart LR
         Server["Deployment server<br/>2..10 реплик<br/>:8080 API, :9090 metrics"]
         SvcWorker["Service worker<br/>ClusterIP :9091"]
         Worker["Deployment worker<br/>1 реплика<br/>:9091 metrics/health"]
+        Headless["Headless Services<br/>server-metrics :9090<br/>worker-metrics :9091"]
+        PromK8s["Deployment prometheus<br/>static config, :9090<br/>(prometheus.enabled)"]
         PG["PostgreSQL<br/>StatefulSet + PVC"]
         Minio["MinIO (pgsty/silo)<br/>StatefulSet + PVC"]
         RMQ["RabbitMQ<br/>StatefulSet + PVC"]
@@ -25,7 +27,7 @@ flowchart LR
         SM["ServiceMonitor<br/>serviceMonitor.enabled"]
     end
 
-    subgraph Monitoring["namespace monitoring"]
+    subgraph Monitoring["namespace monitoring (прод)"]
         Prom["Prometheus Operator"]
         Jaeger["Jaeger<br/>OTLP HTTP :4318"]
     end
@@ -42,6 +44,9 @@ flowchart LR
     Worker -->|"retry / publish"| RMQ
     HPA -.->|"scale"| Server
     Job -->|"goose migrations"| PG
+    Server -.->|"metrics"| Headless
+    Worker -.->|"metrics"| Headless
+    Headless -->|"dns_sd"| PromK8s
     Prom -.->|"scrape :9090"| Server
     Prom -.->|"scrape :9091"| Worker
     SM -.->|"discovery"| Prom
@@ -59,12 +64,14 @@ flowchart LR
 | `ingress-nginx` | Ingress `gophprofile` | Принимает внешний HTTP, проксирует в `Service server`; хост задаётся `ingress.host` |
 | `server` | Deployment + Service | HTTP API, веб-интерфейс, загрузка в S3, запись в PostgreSQL, публикация событий |
 | `worker` | Deployment + Service | Асинхронная обработка: миниатюры, удаление объектов, retry/DLQ |
+| `server-metrics`, `worker-metrics` | Headless Service (`clusterIP: None`) | A-записи на каждый под для сбора метрик: обычный Service балансировал бы скрейпы между репликами |
+| `prometheus` | Deployment + ConfigMap + Service | Сбор метрик на стенде через `dns_sd_configs`; в проде выключен (`prometheus.enabled: false`) |
 | `postgres` | StatefulSet + headless Service + PVC | Метаданные аватарок, статусы обработки, `goose_db_version` |
 | `minio` | StatefulSet + headless Service + PVC | S3-хранилище оригиналов и миниатюр (образ `pgsty/silo`) |
 | `rabbitmq` | StatefulSet + headless Service + PVC | Очереди `avatar.uploaded`, `avatar.deleted`, retry-очереди и DLQ |
 | HPA | HorizontalPodAutoscaler | Масштабирует `server` по CPU/RAM (по умолчанию 2–10 реплик) |
 | Job миграций | Job (Helm hook) | Применяет встроенные миграции тем же образом, что у сервера, с `MIGRATE_ONLY=true` |
-| ConfigMap / Secret | ConfigMap, Secret | Несекретная конфигурация и учётные данные; передаются через `envFrom` |
+| ConfigMap / Secret | ConfigMap, Secret | Несекретная конфигурация и учётные данные; при `secrets.existingSecret` Secret создаётся вне чарта |
 | ServiceAccount | ServiceAccount | `gophprofile-sa` для приложения и Job, `gophprofile-db-sa` для инфраструктуры; токен не монтируется |
 | NetworkPolicy | NetworkPolicy | Default deny + явные разрешения между компонентами |
 | ServiceMonitor | CRD `monitoring.coreos.com/v1` | Обнаружение метрик Prometheus Operator; в локальном кластере выключен |
@@ -192,22 +199,23 @@ sequenceDiagram
 
 | Под | Входящий трафик | Исходящий трафик |
 |---|---|---|
-| `server` | `ingress-nginx` → 8080; `monitoring` → 9090 | PostgreSQL:5432, MinIO:9000, RabbitMQ:5672, DNS kube-system:53 |
-| `worker` | `monitoring` → 9091 | то же, что у server |
+| `server` | `ingress-nginx` → 8080; `app: prometheus` и `monitoring` → 9090 | PostgreSQL:5432, MinIO:9000, RabbitMQ:5672, DNS kube-system:53 |
+| `worker` | `app: prometheus` и `monitoring` → 9091 | то же, что у server |
 | `postgres`, `minio`, `rabbitmq` | только от `server` и `worker` | не ограничен (политика только на Ingress) |
 | `migration` (Helm) | входящий не нужен | PostgreSQL:5432, DNS kube-system:53 |
 
-Метрики открыты только namespace `monitoring`, потому что оттуда их скрейпит
-Prometheus Operator. Если Prometheus установлен в другом namespace, метку в
-правиле нужно изменить. В локальном кластере оператора нет, поэтому скрейп
-здесь не проверялся; сама фильтрация проверена на CNI kindnet (под из другого
-namespace не достучался до `server:8080`).
+Метрики открыты namespace `monitoring` (Prometheus Operator в проде) и подам с
+меткой `app: prometheus` — это встроенный Prometheus стенда, который живёт в
+том же namespace, поэтому `namespaceSelector` его не пропускает. Если
+Prometheus установлен в другом namespace или с другой меткой, правила нужно
+изменить. Фильтрация проверена на CNI kindnet: под без метки не достучался до
+`server-metrics:9090`, под с `app: prometheus` — достучался.
 
 ## Наблюдаемость
 
 | Сигнал | Где | Как попадает наружу |
 |---|---|---|
-| HTTP- и бизнес-метрики | `server:9090/metrics`, `worker:9091/metrics` | Prometheus через ServiceMonitor (в проде) или `kubectl port-forward` |
+| HTTP- и бизнес-метрики | `server:9090/metrics`, `worker:9091/metrics` | На стенде — Prometheus из чарта через headless-сервисы `*-metrics` (`dns_sd_configs`); в проде — Prometheus Operator через ServiceMonitor |
 | Трейсы | OTLP HTTP на `jaeger:4318` | `OTEL_EXPORTER_OTLP_ENDPOINT`; `server` и `worker` в одном трейсе через `traceparent` в AMQP |
 | Логи | stdout в JSON (slog) | `trace_id` и `span_id` подставляются из активного спана; в Docker-стенде — Loki/promtail |
 
@@ -218,6 +226,10 @@ namespace не достучался до `server:8080`).
 `avatars_uploads_total`, `avatars_upload_duration_seconds`,
 `avatars_deletes_total`, `avatars_storage_bytes`, `avatars_file_size_bytes`,
 `avatars_processing_duration_seconds` и метрики пула PostgreSQL.
+
+Сбор на стенде проверен: три цели (`server` ×2, `worker` ×1) в состоянии `up`,
+серии обеих реплик сервера не затирают друг друга, бизнес-метрики
+(`avatars_uploads_total`, `avatars_storage_bytes`) видны в запросах Prometheus.
 
 ## Пробы
 
@@ -237,7 +249,7 @@ readiness-эндпоинта у него нет, подключения пров
   оставлен как набор сырых манифестов для сравнения и отладки без Helm.
 - Окружения задаются `values.yaml` (локально), `values-dev.yaml` (1 реплика,
   HPA выключен) и `values-prod.yaml` (3 реплики, HPA до 20, ServiceMonitor,
-  внешний домен).
+  внешний Secret, внешний домен).
 - Job миграций — хук `post-install,pre-upgrade`. На `install` он запускается
   после создания Secret, ConfigMap и Service `postgres`; на `upgrade` — до
   обновления подов приложения. Повторный запуск безопасен: goose пропускает
@@ -251,8 +263,11 @@ readiness-эндпоинта у него нет, подключения пров
 ## Ограничения локального стенда
 
 - minikube с нодой 6 GB: приложение и инфраструктура занимают ~1.5 GB, поэтому
-  `kube-prometheus-stack` (2–3 GB) не устанавливается. ServiceMonitor лежит в
-  репозитории как артефакт для прода, но локально не применялся.
+  `kube-prometheus-stack` (2–3 GB) не устанавливается. Вместо него метрики
+  собирает встроенный Prometheus со static config (`prometheus.enabled: true`):
+  ConfigMap, Deployment и Service, без оператора и без персистентного хранилища
+  (emptyDir, retention 6h). ServiceMonitor лежит в репозитории как артефакт для
+  прода, локально не применялся.
 - Ingress-контроллер опубликован как NodePort; для доступа с хоста нужен
   `minikube ip` и порт из `kubectl get svc -n ingress-nginx`, либо
   `kubectl port-forward`.

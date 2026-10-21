@@ -5,20 +5,28 @@
 
 ## Kubernetes и Helm
 
-### 1. Секреты лежат в `values.yaml`
+### 1. Секреты: `existingSecret` поддержан, но дефолт остаётся учебным
 
-`helm/gophprofile/values.yaml` содержит учётные данные PostgreSQL, MinIO и
-RabbitMQ открытым текстом. Для учебного стенда это удобно (один `helm install`
-поднимает всё), но в production секреты попадают в values-файл, в историю
-ревизий Helm (`helm get values`) и в Git.
+Чарт умеет не создавать Secret: при `secrets.existingSecret: <имя>` шаблон
+`secret.yaml` не рендерится, а `server`, `worker`, Job миграций и
+инфраструктура читают существующий объект через helper `gophprofile.secretName`.
+В `values-prod.yaml` режим включён (`gophprofile-secrets-external`), поэтому
+пароли в прод-значениях не используются.
 
-**Что сделать:** поддержать `secrets.existingSecret` (чарт не создаёт Secret, а
-ссылается на существующий) и поставлять значения через External Secrets, SOPS
-или Vault. Отдельно учесть `RABBITMQ_URL` в ConfigMap: сейчас он собирается из
-`secrets.rabbitmqUser/Password`, и при выносе секретов URL придётся тоже брать
-из Secret.
+`RABBITMQ_URL` перенесён из ConfigMap в Secret: при внешнем Secret пароль
+брокера не читается из values, и URL `amqp://...` — единственный способ
+передать его приложению. Ключ входит в контракт внешнего Secret вместе с
+`POSTGRES_*`, `MINIO_ROOT_*`, `S3_*`, `RABBITMQ_DEFAULT_*` — всего 10 ключей.
 
-### 2. Миграции при смене пароля БД
+**Что осталось:** в `values.yaml` (локальный стенд) пароли по-прежнему лежат
+открытым текстом — это осознанный компромисс, чтобы `helm install` поднимал
+стенд одной командой. В проде значения приходят из внешней системы (Vault,
+External Secrets, SOPS), а сам Secret создаётся вне Helm; чарт лишь ссылается
+на него. Отдельная задача — проверить ротацию: при смене содержимого внешнего
+Secret поды не перезапускаются автоматически (нет `checksum`-аннотации на
+Secret), и приложение подхватит новые значения только после рестарта.
+
+### 2. Миграции при смене пароля БД и при смене режима Secret
 
 Job миграций — хук `post-install,pre-upgrade` с `envFrom`. Установка, обновление
 и чистая установка проверены на кластере: на `install` хук завершается успешно,
@@ -26,6 +34,12 @@ Job миграций — хук `post-install,pre-upgrade` с `envFrom`. Уст�
 со **сменой учётных данных БД** не проверялся: `pre-upgrade` выполняется до
 применения объектов новой ревизии, поэтому Job читает ConfigMap и Secret в
 старом виде и может подключиться к БД со старым паролем.
+
+Тот же корень у **смены режима Secret** (чарт → `existingSecret`): на
+`pre-upgrade` Job ещё видит Secret предыдущей ревизии, а если включить
+`existingSecret` и удалить старый объект, под падает с
+`CreateContainerConfigError`. Обход — `helm upgrade --no-hooks` (проверено на
+стенде), но это ручной шаг, а не решение.
 
 **Что сделать:** передавать Job'у актуальные параметры подключения явно (или
 перенести хук на `post-upgrade`) и проверить обновление с изменением пароля на
@@ -43,18 +57,21 @@ Job миграций — хук `post-install,pre-upgrade` с `envFrom`. Уст�
 (`helm template`) либо удалить сырые манифесты. Сейчас `k8s/` сохранён для
 сравнения и отладки без Helm.
 
-### 4. NetworkPolicy и Prometheus зависят от имени namespace
+### 4. NetworkPolicy и Prometheus зависят от имени namespace и метки
 
-Правила доступа к метрикам (`server:9090`, `worker:9091`) жёстко ограничены
-namespace с меткой `kubernetes.io/metadata.name: monitoring`. Если Prometheus
-установлен в другой namespace, скрейп перестанет работать. Вторая зависимость —
-ServiceMonitor: он требует CRD Prometheus Operator и метку `release`, совпадающую
-с именем helm-релиза стека (`serviceMonitor.releaseLabel`). В локальном кластере
-оператора нет, поэтому ServiceMonitor не применялся и скрейп не проверялся.
+Правила доступа к метрикам (`server:9090`, `worker:9091`) разрешают два
+источника: namespace с меткой `kubernetes.io/metadata.name: monitoring` и поды
+с меткой `app: prometheus` в самом namespace приложения (встроенный Prometheus
+стенда). Если Prometheus Operator установлен в другом namespace, а метка
+встроенного Prometheus изменена, скрейп перестанет работать. Вторая
+зависимость — ServiceMonitor: он требует CRD Prometheus Operator и метку
+`release`, совпадающую с именем helm-релиза стека (`serviceMonitor.releaseLabel`).
+В локальном кластере оператора нет, поэтому ServiceMonitor не применялся;
+сбор метрик проверен встроенным Prometheus'ом (три цели в состоянии `up`).
 
-**Что сделать:** вынести имя namespace мониторинга в `values.yaml` и
-использовать его в NetworkPolicy и ServiceMonitor; проверять скрейп после
-установки стека оператора.
+**Что сделать:** вынести имя namespace мониторинга и метку Pod'а в
+`values.yaml` и использовать их в NetworkPolicy и ServiceMonitor; проверять
+скрейп после установки стека оператора.
 
 ## Надёжность и эксплуатация
 
@@ -90,12 +107,3 @@ RabbitMQ соединение остаётся закрытым до перез�
 **Что сделать:** для production перенести ограничение на ingress
 (`nginx-ingress` limit-rps, Envoy/Istio) или использовать распределённый
 лимитер на Redis; `RATE_LIMIT_RPS` в приложении оставить страховкой.
-
-## Тестирование
-
-### 8. **Глобальные метрики и тестируемость** — `internal/metrics/`
-использует пакетные `var` и `promauto`, из-за чего зависимости
-неявны и усложняется изолированное тестирование.
-План: перейти к `Metrics + NewMetrics(reg prometheus.Registerer)`
-и передавать коллекторы через зависимости.
-В рамках текущего шага Go-код не меняется.
