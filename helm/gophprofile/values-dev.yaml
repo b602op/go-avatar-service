@@ -1,0 +1,17 @@
+# Окружение разработки: минимум ресурсов, один под сервера, без автомасштабирования.
+#   helm install gophprofile ./helm/gophprofile -n gophprofile --create-namespace \
+#     -f helm/gophprofile/values-dev.yaml
+
+server:
+  # HPA выключен ниже, поэтому replicas — фактическое число подов, а не стартовое.
+  replicas: 1
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+
+postgres:
+  storage: 512Mi
+
+hpa:
+  enabled: false

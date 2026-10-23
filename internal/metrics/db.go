@@ -25,35 +25,36 @@ const (
 // Prometheus при скрейпе, а pgxpool.Stat() читает атомарные счётчики пула —
 // это O(1) без блокировок и без фоновой горутины.
 //
-// Функция рассчитана на однократный вызов на процесс (регистрация в глобальном
-// реестре promauto): повторный вызов с тем же пулом — ошибка программиста.
-func RegisterDBPoolMetrics(pool *pgxpool.Pool) {
+// Метод рассчитан на однократный вызов на процесс: повторная регистрация тех же
+// имён в том же реестре — ошибка программиста (promauto паникует).
+func (m *Set) RegisterDBPoolMetrics(pool *pgxpool.Pool) {
 	// Stat() дёргается на каждый скрейп и каждый раз берёт свежий снимок,
 	// поэтому отдельный кэш или таймер не нужен.
 	stat := pool.Stat
+	factory := promauto.With(m.reg)
 
-	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+	factory.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: MetricDBPoolConnections,
 		Help: "Total number of connections in the pool.",
 	}, func() float64 {
 		return float64(stat().TotalConns())
 	})
 
-	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+	factory.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: MetricDBPoolConnectionsIdle,
 		Help: "Number of idle connections in the pool.",
 	}, func() float64 {
 		return float64(stat().IdleConns())
 	})
 
-	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+	factory.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: MetricDBPoolConnectionsUsed,
 		Help: "Number of connections currently acquired from the pool.",
 	}, func() float64 {
 		return float64(stat().AcquiredConns())
 	})
 
-	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+	factory.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: MetricDBPoolConnectionsMax,
 		Help: "Maximum number of connections the pool can hold.",
 	}, func() float64 {

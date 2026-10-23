@@ -26,13 +26,13 @@ func newLazyPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// gaugeValue скрейпит дефолтный реестр и возвращает значение метрики по имени.
+// gaugeValue скрейпит реестр и возвращает значение метрики по имени.
 // Заодно проверяет, что серия ровно одна и без лейблов: метрики пула — это
 // «одна метрика на процесс», лейблы только раздували бы кардинальность.
-func gaugeValue(t *testing.T, name string) float64 {
+func gaugeValue(t *testing.T, gatherer prometheus.Gatherer, name string) float64 {
 	t.Helper()
 
-	families, err := prometheus.DefaultGatherer.Gather()
+	families, err := gatherer.Gather()
 	require.NoError(t, err)
 
 	for _, family := range families {
@@ -58,7 +58,9 @@ func gaugeValue(t *testing.T, name string) float64 {
 // значения метрик совпадают со снимком пула на момент скрейпа.
 func TestRegisterDBPoolMetrics(t *testing.T) {
 	pool := newLazyPool(t)
-	RegisterDBPoolMetrics(pool)
+	reg := prometheus.NewRegistry()
+	m := NewSet(reg)
+	m.RegisterDBPoolMetrics(pool)
 
 	// Пул ленивый: соединений ещё нет, поэтому Stat() предсказуем и не меняется
 	// между снимком и скрейпом.
@@ -66,20 +68,20 @@ func TestRegisterDBPoolMetrics(t *testing.T) {
 
 	assert.Equal(t,
 		float64(stat.TotalConns()),
-		gaugeValue(t, MetricDBPoolConnections),
+		gaugeValue(t, reg, MetricDBPoolConnections),
 	)
 	assert.Equal(t,
 		float64(stat.IdleConns()),
-		gaugeValue(t, MetricDBPoolConnectionsIdle),
+		gaugeValue(t, reg, MetricDBPoolConnectionsIdle),
 	)
 	assert.Equal(t,
 		float64(stat.AcquiredConns()),
-		gaugeValue(t, MetricDBPoolConnectionsUsed),
+		gaugeValue(t, reg, MetricDBPoolConnectionsUsed),
 	)
 
 	// MaxConns — настроенная ёмкость пула, а не счётчик текущих соединений:
 	// у ленивого пула она не нулевая, в отличие от остальных значений.
-	maxConns := gaugeValue(t, MetricDBPoolConnectionsMax)
+	maxConns := gaugeValue(t, reg, MetricDBPoolConnectionsMax)
 	assert.Equal(t, float64(stat.MaxConns()), maxConns)
 	assert.Positive(t, maxConns)
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/disintegration/imaging"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -354,7 +355,7 @@ func TestHandler_HandleUpload_Success(t *testing.T) {
 	uploadOriginal(t, env, ctx, a, makeJPEG(t, 500, 500))
 
 	// Реальный ресайз: проверяем всю цепочку, включая фактические размеры.
-	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), nil)
+	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), nil, testMetrics())
 	require.NoError(t, h.HandleUpload(ctx, uploadEvent(a)))
 
 	got, err := env.repo.GetByID(ctx, a.ID)
@@ -388,7 +389,7 @@ func TestHandler_HandleUpload_Success(t *testing.T) {
 func TestHandler_HandleUpload_NotFound(t *testing.T) {
 	env, ctx := setupTest(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 
 	// Аватар не существует → мягкое завершение (ack), без ошибки.
 	err := h.HandleUpload(ctx, publisher.AvatarUploadEvent{
@@ -408,7 +409,7 @@ func TestHandler_HandleUpload_AlreadyCompleted(t *testing.T) {
 		"100x100": services.ThumbnailKey(a.UserID, a.ID, "100x100"),
 	}))
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 	require.NoError(t, h.HandleUpload(ctx, uploadEvent(a)))
 
 	// Повторной обработки не было: миниатюра 300x300 в S3 не появилась.
@@ -419,7 +420,7 @@ func TestHandler_HandleUpload_AlreadyCompleted(t *testing.T) {
 func TestHandler_HandleUpload_InvalidID(t *testing.T) {
 	env, ctx := setupTest(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 
 	err := h.HandleUpload(ctx, publisher.AvatarUploadEvent{
 		AvatarID:  "not-a-uuid",
@@ -437,7 +438,7 @@ func TestHandler_HandleUpload_S3DownloadFails(t *testing.T) {
 	// Запись есть, но объекта в S3 нет.
 	a := newPendingAvatar(t, env, ctx)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 
 	err := h.HandleUpload(ctx, uploadEvent(a))
 	require.Error(t, err)
@@ -452,7 +453,7 @@ func TestHandler_HandleUpload_ResizeFails(t *testing.T) {
 	rz := &mockResizer{fn: func([]byte, map[string]resizer.Size) (map[string][]byte, error) {
 		return nil, assert.AnError
 	}}
-	h := NewHandler(env.repo, env.storage, rz, nil)
+	h := NewHandler(env.repo, env.storage, rz, nil, testMetrics())
 
 	err := h.HandleUpload(ctx, uploadEvent(a))
 	require.Error(t, err)
@@ -472,7 +473,7 @@ func TestHandler_HandleUpload_InvalidImage(t *testing.T) {
 	uploadOriginal(t, env, ctx, a, []byte("definitely not an image"))
 
 	// Ресайзер настоящий: ошибка обязана возникнуть на шаге размеров, а не ресайза.
-	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), nil)
+	h := NewHandler(env.repo, env.storage, ResizerFunc(resizer.ResizeBatch), nil, testMetrics())
 
 	err := h.HandleUpload(ctx, uploadEvent(a))
 	require.Error(t, err)
@@ -494,13 +495,15 @@ func TestHandler_HandleUpload_InvalidImage(t *testing.T) {
 // Инфраструктура не нужна: репозиторий-стаб паникует ещё до обращения к S3,
 // поэтому тест выполняется и при недоступных контейнерах (см. TestMain).
 func TestHandler_HandleUpload_Panic(t *testing.T) {
-	before := processingSamples(t, metrics.StatusPanic)
+	reg := prometheus.NewRegistry()
+	m := metrics.NewSet(reg)
+	before := processingSamples(t, reg, metrics.StatusPanic)
 
 	// Паникуем на самом первом обращении к БД внутри HandleUpload.
 	repo := &stubRepo{getByIDFn: func(context.Context, uuid.UUID) (*domain.Avatar, error) {
 		panic("boom")
 	}}
-	h := NewHandler(repo, stubStorage{}, &mockResizer{}, testLogger())
+	h := NewHandler(repo, stubStorage{}, &mockResizer{}, testLogger(), m)
 
 	assert.Panics(t, func() {
 		_ = h.HandleUpload(context.Background(), uploadEvent(&domain.Avatar{
@@ -510,7 +513,7 @@ func TestHandler_HandleUpload_Panic(t *testing.T) {
 		}))
 	})
 
-	assert.Greater(t, processingSamples(t, metrics.StatusPanic), before,
+	assert.Greater(t, processingSamples(t, reg, metrics.StatusPanic), before,
 		"паника должна наблюдаться с меткой status=%q", metrics.StatusPanic)
 }
 
@@ -529,7 +532,7 @@ func TestHandler_HandleDelete_Success(t *testing.T) {
 		require.NoError(t, env.storage.Upload(ctx, k, bytes.NewReader(data), int64(len(data)), "image/jpeg"))
 	}
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 	require.NoError(t, h.HandleDelete(ctx, publisher.AvatarDeleteEvent{
 		AvatarID:  uuid.NewString(),
 		UserID:    "user-1",
@@ -546,7 +549,7 @@ func TestHandler_HandleDelete_Success(t *testing.T) {
 func TestHandler_HandleDelete_EmptyKeys(t *testing.T) {
 	env, ctx := setupTest(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 	err := h.HandleDelete(ctx, publisher.AvatarDeleteEvent{
 		AvatarID:  uuid.NewString(),
 		UserID:    "user-1",
@@ -559,7 +562,7 @@ func TestHandler_HandleDelete_EmptyKeys(t *testing.T) {
 func TestHandler_HandleDelete_InvalidID(t *testing.T) {
 	env, ctx := setupTest(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 	err := h.HandleDelete(ctx, publisher.AvatarDeleteEvent{
 		AvatarID:  "not-a-uuid",
 		UserID:    "user-1",
@@ -573,7 +576,7 @@ func TestHandler_HandleDelete_InvalidID(t *testing.T) {
 func TestHandler_HandleDelete_NotExists(t *testing.T) {
 	env, ctx := setupTest(t)
 
-	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil)
+	h := NewHandler(env.repo, env.storage, &mockResizer{}, nil, testMetrics())
 
 	// Ключей в S3 нет — удаление идемпотентно, ошибки быть не должно.
 	err := h.HandleDelete(ctx, publisher.AvatarDeleteEvent{

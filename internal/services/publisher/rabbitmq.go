@@ -19,6 +19,7 @@ import (
 	"github.com/b602op/avatars-service/internal/amqpx"
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/services/circuitbreaker"
 )
 
 // Топология событий аватарок: routing keys и имена очередей.
@@ -84,6 +85,15 @@ type RabbitMQPublisher struct {
 	channel  *amqp.Channel
 	exchange string
 	log      *slog.Logger
+
+	// breaker защищает публикацию от вызовов к лежащему брокеру: пока он
+	// открыт, publish падает сразу с ErrCircuitOpen, не занимая горутину
+	// HTTP-запроса ожиданием недоступного RabbitMQ.
+	//
+	// Подключение и объявление топологии (NewRabbitMQ, DeclareTopology) вне
+	// breaker'а: это разовая операция старта, её отказ должен быть виден
+	// вызывающему как есть.
+	breaker *circuitbreaker.Breaker
 }
 
 // NewRabbitMQ подключается к RabbitMQ и объявляет топологию (exchange + очереди).
@@ -122,6 +132,7 @@ func NewRabbitMQ(cfg config.RabbitMQConfig, log *slog.Logger) (*RabbitMQPublishe
 		channel:  ch,
 		exchange: cfg.Exchange,
 		log:      log,
+		breaker:  circuitbreaker.New("rabbitmq", circuitbreaker.LogStateChanges(log)),
 	}, nil
 }
 
@@ -324,7 +335,14 @@ func (p *RabbitMQPublisher) publish(ctx context.Context, routingKey, messageID s
 	// context propagation между server и worker.
 	otel.GetTextMapPropagator().Inject(ctx, amqpx.HeaderCarrier(msg.Headers))
 
-	if err = p.channel.PublishWithContext(ctx, p.exchange, routingKey, false, false, msg); err != nil {
+	// В breaker оборачивается только сетевой вызов публикации. Ошибки
+	// маршалинга — это ошибка данных, а не деградация брокера, и открывать
+	// breaker на них нельзя: иначе битое событие одного вида «сломает»
+	// публикацию вообще всех событий.
+	err = p.breaker.ExecuteNoResult(func() error {
+		return p.channel.PublishWithContext(ctx, p.exchange, routingKey, false, false, msg)
+	})
+	if err != nil {
 		return fmt.Errorf("publisher: publish %s: %w", routingKey, err)
 	}
 

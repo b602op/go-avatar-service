@@ -21,18 +21,18 @@ const storageUpdateInterval = 30 * time.Second
 // хранилище они не должны учитываться как занятое место.
 const storageQuery = `SELECT COALESCE(SUM(size_bytes), 0) FROM avatars WHERE deleted_at IS NULL`
 
-// StartStorageUpdater поддерживает AvatarsStorageBytes в актуальном состоянии.
+// StartStorageUpdater поддерживает m.AvatarsStorageBytes в актуальном состоянии.
 //
 // Первый пересчёт выполняется сразу при старте: иначе на графике был бы провал
 // в storageUpdateInterval, а метрика выглядела бы как «хранилище пустое».
 //
 // Дальше значение обновляется раз в storageUpdateInterval в отдельной горутине —
 // /metrics не должен ходить в БД на каждом скрейпе. Функция блокирующая:
-// вызывать её нужно как `go StartStorageUpdater(...)`, остановка — по ctx.Done().
+// вызывать её нужно как `go m.StartStorageUpdater(...)`, остановка — по ctx.Done().
 //
 // Ошибка запроса не роняет процесс и не обнуляет метрику: в лог уходит Warn,
 // а gauge сохраняет предыдущее значение.
-func StartStorageUpdater(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
+func (m *Set) StartStorageUpdater(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -43,7 +43,7 @@ func StartStorageUpdater(ctx context.Context, pool *pgxpool.Pool, log *slog.Logg
 			log.WarnContext(ctx, "failed to query storage bytes", "error", err)
 			return
 		}
-		AvatarsStorageBytes.Set(float64(total))
+		m.AvatarsStorageBytes.Set(float64(total))
 	}
 
 	update()

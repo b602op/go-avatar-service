@@ -1,0 +1,125 @@
+# PostgreSQL: StatefulSet с локальным PVC.
+#
+# StatefulSet, а не Deployment: у БД есть состояние, и она должна сохранять
+# привязку «под ↔ том» между перезапусками. volumeClaimTemplates создаёт PVC
+# на каждую реплику (postgres-data-0) из StorageClass по умолчанию (standard).
+#
+# Service headless (clusterIP: None) — обязательное условие для StatefulSet:
+# он даёт стабильное DNS-имя postgres.<ns>.svc, по которому приложение
+# подключается к единственной реплике.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: gophprofile
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None # headless для StatefulSet
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: gophprofile
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # Инфраструктурный SA (60-serviceaccount.yaml): БД тоже не обращается к
+      # Kubernetes API, токен ей не монтируется.
+      serviceAccountName: gophprofile-db-sa
+      # fsGroup: 1000 — групповое владение томом. В этом кластере тома лежат на
+      # hostPath (provisioner k8s.io/minikube-hostpath), а kubelet права на
+      # hostPath-томах не переписывает: после применения манифеста
+      # /var/lib/postgresql/data остался root:root, и fsGroup здесь работает
+      # только как дополнительная группа процесса (видно в `id`: groups=...1000).
+      # С CSI-провижнером в проде kubelet выставит группу 1000 и на файлах —
+      # тогда запись в том не будет зависеть от uid конкретного образа.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB: официальный образ
+          # создаёт пользователя и базу при первой инициализации тома.
+          envFrom:
+            - secretRef:
+                name: gophprofile-secrets
+          env:
+            # Данные в подкаталоге pgdata, а не в корне тома: на томе может
+            # лежать lost+found, из-за которого initdb отказывается работать.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # readOnlyRootFilesystem намеренно НЕ включается: БД пишет не только в
+          # том (WAL, временные файлы сортировки в /var/lib/postgresql/data/pgdata
+          # и /tmp), и корневая ФС только для чтения сломала бы её работу.
+          #
+          # Капабилити: drop ALL + явный возврат минимума. Полный drop проверен
+          # и не работает — контейнер уходил в CrashLoopBackOff с
+          #   chmod: /var/lib/postgresql/data/pgdata: Operation not permitted
+          #   find: /var/lib/postgresql/data/pgdata: Permission denied
+          # Потому что entrypoint образа запускается от root и готовит том
+          # (chmod 00700 PGDATA, chown postgres), а затем сбрасывает привилегии
+          # через gosu. Root без капабилити — это обычный непривилегированный
+          # пользователь: права на чужие файлы у него не шире, чем у владельца.
+          # Отсюда возвращённый минимум:
+          #   CHOWN / DAC_OVERRIDE — обойти права и сменить владельца данных;
+          #   FOWNER               — chmod каталогов, которыми владеет не root;
+          #   SETUID / SETGID      — сбросить привилегии на пользователя postgres.
+          # Всё остальное (NET_RAW, MKNOD, SETPCAP и прочее из дефолтного набора
+          # Docker) остаётся выключенным, а allowPrivilegeEscalation: false не
+          # даёт вернуть привилегии через setuid-бинарник в образе.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - SETGID
+                - SETUID
+          # pg_isready — штатный способ проверки готовности: он проверяет, что
+          # сервер принимает соединения, а не просто что процесс запущен.
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "avatar", "-d", "avatars"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "avatar", "-d", "avatars"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

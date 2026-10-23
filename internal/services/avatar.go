@@ -34,23 +34,35 @@ type AvatarService struct {
 	storage   domain.ObjectStorage
 	publisher domain.EventPublisher
 	log       *slog.Logger
+	metrics   *metrics.Set
 }
 
 // NewAvatarService создаёт сервис аватарок.
+//
+// m обязателен: сервис пишет бизнес-метрики на каждой загрузке и удалении, и
+// «молчаливый» fallback на глобальный реестр скрывал бы ошибку сборки
+// зависимостей. nil — ошибка программиста, поэтому паника, а не тихая подмена.
 func NewAvatarService(
 	repo domain.AvatarRepository,
 	storage domain.ObjectStorage,
 	publisher domain.EventPublisher,
 	log *slog.Logger,
+	m *metrics.Set,
 ) *AvatarService {
+	if m == nil {
+		panic("services: NewAvatarService: metrics is nil")
+	}
+
 	if log == nil {
 		log = slog.Default()
 	}
+
 	return &AvatarService{
 		repo:      repo,
 		storage:   storage,
 		publisher: publisher,
 		log:       log,
+		metrics:   m,
 	}
 }
 
@@ -79,8 +91,8 @@ func (s *AvatarService) Upload(
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
-		metrics.AvatarsUploadDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+		s.metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
+		s.metrics.AvatarsUploadDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
 	}()
 
 	if err := ValidateImage(data, contentType); err != nil {
@@ -141,7 +153,7 @@ func (s *AvatarService) Upload(
 
 	// Размер наблюдается только у принятого файла: отказы валидации — это про
 	// avatars_uploads_total{status="error"}, а не про распределение размеров.
-	metrics.AvatarsFileSize.Observe(float64(len(data)))
+	s.metrics.AvatarsFileSize.Observe(float64(len(data)))
 
 	s.log.InfoContext(ctx, "avatar uploaded", "avatar_id", avatarID, "user_id", userID)
 	return avatar, nil
@@ -240,7 +252,7 @@ func (s *AvatarService) Delete(ctx context.Context, id uuid.UUID, requesterID st
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsDeletesTotal.WithLabelValues(status).Inc()
+		s.metrics.AvatarsDeletesTotal.WithLabelValues(status).Inc()
 	}()
 
 	avatar, err := s.repo.GetByID(ctx, id)

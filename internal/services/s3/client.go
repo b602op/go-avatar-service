@@ -23,6 +23,7 @@ import (
 
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/services/circuitbreaker"
 )
 
 // defaultContentType применяется, когда вызывающая сторона не задала MIME-тип.
@@ -48,6 +49,15 @@ type Client struct {
 	bucket string
 	region string
 	log    *slog.Logger
+
+	// breaker защищает операции над объектами от вызовов к лежащему хранилищу.
+	//
+	// Оборачиваются только операции с объектами (Upload, Download, StatObject,
+	// Delete, DeleteMany). EnsureBucket и HealthCheck намеренно остаются вне
+	// breaker'а: они отвечают на вопрос «доступно ли хранилище вообще», и ответ
+	// «breaker открыт» здесь был бы подменой реального состояния зависимости —
+	// ровно то, что /health должен показывать честно.
+	breaker *circuitbreaker.Breaker
 }
 
 // New создаёт клиент S3.
@@ -80,6 +90,13 @@ func New(cfg config.S3Config, log *slog.Logger) (*Client, error) {
 		bucket: cfg.Bucket,
 		region: cfg.Region,
 		log:    log,
+		breaker: circuitbreaker.New("s3",
+			// Отсутствие объекта — штатный ответ (аватарку могли удалить), а не
+			// деградация хранилища: без этого исключения пять подряд запросов к
+			// удалённым аватарам открывали бы breaker и роняли бы весь S3-путь.
+			circuitbreaker.WithIsExcluded(isNotFound),
+			circuitbreaker.LogStateChanges(log),
+		),
 	}, nil
 }
 
@@ -151,8 +168,10 @@ func (c *Client) Upload(ctx context.Context, key string, r io.Reader, size int64
 		contentType = defaultContentType
 	}
 
-	_, err = c.mc.PutObject(ctx, c.bucket, key, r, size, minio.PutObjectOptions{
-		ContentType: contentType,
+	_, err = circuitbreaker.Do(c.breaker, func() (minio.UploadInfo, error) {
+		return c.mc.PutObject(ctx, c.bucket, key, r, size, minio.PutObjectOptions{
+			ContentType: contentType,
+		})
 	})
 	if err != nil {
 		c.log.DebugContext(ctx, "s3 upload failed", "key", key, "error", err)
@@ -181,7 +200,22 @@ func (c *Client) Download(ctx context.Context, key string) (rc io.ReadCloser, in
 		span.End()
 	}()
 
-	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
+	// GetObject ленив: HTTP-запроса при его вызове нет, поэтому в breaker
+	// оборачиваются оба шага — сам GetObject и обязательный Stat, который и
+	// выполняет запрос к хранилищу. Иначе breaker не увидел бы реальных сбоев.
+	dl, err := circuitbreaker.Do(c.breaker, func() (downloadResult, error) {
+		obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
+		if err != nil {
+			return downloadResult{}, err
+		}
+
+		stat, err := obj.Stat()
+		if err != nil {
+			_ = obj.Close()
+			return downloadResult{}, err
+		}
+		return downloadResult{obj: obj, stat: stat}, nil
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil, domain.ErrNotFound
@@ -189,17 +223,15 @@ func (c *Client) Download(ctx context.Context, key string) (rc io.ReadCloser, in
 		return nil, nil, fmt.Errorf("s3: download %q: %w", key, err)
 	}
 
-	// GetObject ленив: ошибка отсутствующего объекта всплывает только при Stat.
-	stat, err := obj.Stat()
-	if err != nil {
-		_ = obj.Close()
-		if isNotFound(err) {
-			return nil, nil, domain.ErrNotFound
-		}
-		return nil, nil, fmt.Errorf("s3: download %q: %w", key, err)
-	}
+	return dl.obj, toObjectInfo(dl.stat), nil
+}
 
-	return obj, toObjectInfo(stat), nil
+// downloadResult — результат успешного Download: поток чтения и метаданные.
+// Нужен как единый тип значения для circuitbreaker.Do, чтобы открытый
+// breaker не отдавал наружу полупустой результат.
+type downloadResult struct {
+	obj  *minio.Object
+	stat minio.ObjectInfo
 }
 
 // StatObject возвращает метаданные объекта. Если объекта нет — domain.ErrNotFound.
@@ -219,7 +251,9 @@ func (c *Client) StatObject(ctx context.Context, key string) (info *domain.Objec
 		span.End()
 	}()
 
-	stat, err := c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
+	stat, err := circuitbreaker.Do(c.breaker, func() (minio.ObjectInfo, error) {
+		return c.mc.StatObject(ctx, c.bucket, key, minio.StatObjectOptions{})
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, domain.ErrNotFound
@@ -249,7 +283,9 @@ func (c *Client) Delete(ctx context.Context, key string) (err error) {
 		span.End()
 	}()
 
-	if err = c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+	if err = c.breaker.ExecuteNoResult(func() error {
+		return c.mc.RemoveObject(ctx, c.bucket, key, minio.RemoveObjectOptions{})
+	}); err != nil {
 		return fmt.Errorf("s3: delete %q: %w", key, err)
 	}
 	return nil
@@ -289,12 +325,19 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) (err error) {
 		}
 	}()
 
-	var errs []error
-	for res := range c.mc.RemoveObjects(ctx, c.bucket, objectsCh, minio.RemoveObjectsOptions{}) {
-		c.log.WarnContext(ctx, "s3 batch delete failed", "key", res.ObjectName, "error", res.Err)
-		errs = append(errs, fmt.Errorf("delete %q: %w", res.ObjectName, res.Err))
-	}
-	return errors.Join(errs...)
+	// RemoveObjects ленив: ошибки по отдельным ключам приходят не из возврата
+	// вызова, а из канала результатов. Поэтому в breaker оборачивается весь
+	// разбор канала, а агрегированная ошибка возвращается наружу как результат —
+	// иначе breaker никогда не увидел бы сбоев batch-удаления.
+	_, err = circuitbreaker.Do(c.breaker, func() ([]error, error) {
+		var errs []error
+		for res := range c.mc.RemoveObjects(ctx, c.bucket, objectsCh, minio.RemoveObjectsOptions{}) {
+			c.log.WarnContext(ctx, "s3 batch delete failed", "key", res.ObjectName, "error", res.Err)
+			errs = append(errs, fmt.Errorf("delete %q: %w", res.ObjectName, res.Err))
+		}
+		return errs, errors.Join(errs...)
+	})
+	return err
 }
 
 // HealthCheck проверяет доступность хранилища и наличие бакета.

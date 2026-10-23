@@ -1,0 +1,53 @@
+{{/*
+Несекретная конфигурация server и worker (envFrom: configMapRef).
+
+Адреса сервисов — короткие DNS-имена внутри namespace: поды ходят друг к другу
+по имени Service и внутреннему порту контейнера, как в compose по именам
+сервисов. Паролей здесь нет вообще — они в Secret (templates/secret.yaml), в
+том числе RABBITMQ_URL, в котором зашит пароль брокера.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gophprofile-config
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+data:
+  # ─── Приложение ───
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+
+  # ─── OpenTelemetry ───
+  # Jaeger в чарт не входит (он вне Chart). Пока его нет, экспортёр OTLP
+  # подключается лениво и пишет warning («traces export: connection refused»),
+  # но приложение не останавливается: сборка спанов best-effort.
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  # К имени добавляется суффикс -server/-worker (см. cmd/*/main.go), поэтому
+  # в Jaeger видны два сервиса с общим префиксом.
+  OTEL_SERVICE_NAME: {{ .Values.config.otelServiceName | quote }}
+  OTEL_SERVICE_VERSION: {{ .Values.config.otelServiceVersion | quote }}
+  OTEL_ENVIRONMENT: {{ .Values.config.otelEnvironment | quote }}
+
+  # ─── PostgreSQL ───
+  # postgres — headless Service StatefulSet'а; DNS резолвится в IP единственной
+  # реплики. POSTGRES_USER/PASSWORD/DB приходят из Secret.
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_SSLMODE: "disable"
+
+  # ─── S3 / MinIO ───
+  S3_ENDPOINT: "minio:9000"
+  S3_BUCKET: {{ .Values.config.s3Bucket | quote }}
+  S3_REGION: {{ .Values.config.s3Region | quote }}
+  S3_USE_SSL: {{ .Values.config.s3UseSSL | quote }}
+
+  # ─── RabbitMQ ───
+  # RABBITMQ_URL здесь нет: в URL зашит пароль брокера, а ConfigMap не для
+  # секретов (значение видно в `kubectl get configmap -o yaml` и в history
+  # Helm). Ключ RABBITMQ_URL лежит в Secret и подставляется в поды через
+  # env[].valueFrom.secretKeyRef (см. templates/20-server.yaml, 21-worker.yaml).
+  RABBITMQ_EXCHANGE: {{ .Values.config.rabbitmqExchange | quote }}
+  # Go-формат duration: config.Load() парсит значение через time.ParseDuration,
+  # и «30000» уронило бы старт с ошибкой "must be a valid duration".
+  RABBITMQ_RETRY_TTL: {{ .Values.config.rabbitmqRetryTTL | quote }}

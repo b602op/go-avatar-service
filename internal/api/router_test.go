@@ -56,13 +56,16 @@ func healthStubHandler() http.HandlerFunc {
 }
 
 // newRouterWithHandler собирает роутер с реальным хендлером на стабе сервиса.
-func newRouterWithHandler() *chi.Mux {
+func newRouterWithHandler(t *testing.T) *chi.Mux {
+	t.Helper()
+
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewRouter(RouterDeps{
 		Log:            log,
 		AvatarHandler:  handlers.NewAvatarHandler(apiStubService{}, log),
 		Health:         healthStubHandler(),
 		AllowedOrigins: []string{"*"},
+		Metrics:        newTestMetrics(t),
 	})
 }
 
@@ -83,7 +86,7 @@ func newTestRouter() *chi.Mux {
 }
 
 func TestRouter_Health(t *testing.T) {
-	router := NewRouter(RouterDeps{Health: healthStubHandler()})
+	router := NewRouter(RouterDeps{Health: healthStubHandler(), Metrics: newTestMetrics(t)})
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -96,7 +99,7 @@ func TestRouter_Health(t *testing.T) {
 // TestRouter_Health_NilHandler проверяет, что роутер без переданного хендлера
 // /health не паникует, а честно сообщает о нерабочих зависимостях.
 func TestRouter_Health_NilHandler(t *testing.T) {
-	router := NewRouter(RouterDeps{})
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -108,8 +111,37 @@ func TestRouter_Health_NilHandler(t *testing.T) {
 	assert.Equal(t, "down", resp.Status)
 }
 
+// TestRouter_Live проверяет, что liveness-эндпоинт отвечает 200 и не зависит от
+// состояния зависимостей: роутер собран вообще без хендлера /health.
+func TestRouter_Live(t *testing.T) {
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"status":"ok"}`, rec.Body.String())
+}
+
+// TestRouter_Live_IndependentFromHealth — контракт проб: /live отвечает 200
+// даже тогда, когда /health отдаёт 503 (зависимости недоступны). Именно это
+// различие не даёт kubelet перезапускать под из-за лежащего S3.
+func TestRouter_Live_IndependentFromHealth(t *testing.T) {
+	// Роутер без Health: /health честно отвечает 503 («down»).
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
+
+	healthRec := httptest.NewRecorder()
+	router.ServeHTTP(healthRec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	require.Equal(t, http.StatusServiceUnavailable, healthRec.Code)
+
+	liveRec := httptest.NewRecorder()
+	router.ServeHTTP(liveRec, httptest.NewRequest(http.MethodGet, "/live", nil))
+	assert.Equal(t, http.StatusOK, liveRec.Code)
+}
+
 func TestRouter_RootRedirectsToWebUpload(t *testing.T) {
-	router := NewRouter(RouterDeps{})
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -119,7 +151,7 @@ func TestRouter_RootRedirectsToWebUpload(t *testing.T) {
 }
 
 func TestRouter_NotFound(t *testing.T) {
-	router := NewRouter(RouterDeps{})
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
 
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/unknown", nil))
@@ -132,7 +164,7 @@ func TestRouter_StaticHTML(t *testing.T) {
 	// рабочая директория — сам пакет, поэтому поднимаемся на два уровня.
 	t.Chdir("../../")
 
-	router := NewRouter(RouterDeps{})
+	router := NewRouter(RouterDeps{Metrics: newTestMetrics(t)})
 
 	// http.FileServer канонизирует путь .../index.html → .../ (301 Moved
 	// Permanently) — стандартное поведение net/http. Проверяем сам редирект.
@@ -226,7 +258,7 @@ func TestMiddleware_RequestLogger(t *testing.T) {
 }
 
 func TestRouter_APIRequiresUserID_Post(t *testing.T) {
-	router := newRouterWithHandler()
+	router := newRouterWithHandler(t)
 
 	// POST без заголовка X-User-ID → 400 от middleware.
 	rec := httptest.NewRecorder()
@@ -237,7 +269,7 @@ func TestRouter_APIRequiresUserID_Post(t *testing.T) {
 }
 
 func TestRouter_APIRequiresUserID_Delete(t *testing.T) {
-	router := newRouterWithHandler()
+	router := newRouterWithHandler(t)
 
 	// DELETE без заголовка X-User-ID → 400 от middleware.
 	rec := httptest.NewRecorder()
@@ -248,7 +280,7 @@ func TestRouter_APIRequiresUserID_Delete(t *testing.T) {
 }
 
 func TestRouter_APIAllowsGetWithoutUserID(t *testing.T) {
-	router := newRouterWithHandler()
+	router := newRouterWithHandler(t)
 
 	// GET без заголовка X-User-ID → маршрут публичный, middleware не применяется.
 	// Ожидаем 404 (аватара нет), но точно не 400 (invalid X-User-ID).
@@ -260,7 +292,7 @@ func TestRouter_APIAllowsGetWithoutUserID(t *testing.T) {
 }
 
 func TestRouter_APIAcceptsUserID(t *testing.T) {
-	router := newRouterWithHandler()
+	router := newRouterWithHandler(t)
 
 	// С валидным X-User-ID запрос доходит до хендлера (стаб отдаёт ErrNotFound → 404).
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/avatars/"+uuid.NewString(), nil)
@@ -274,7 +306,7 @@ func TestRouter_APIAcceptsUserID(t *testing.T) {
 }
 
 func TestRouter_UploadRouteContract(t *testing.T) {
-	router := newRouterWithHandler()
+	router := newRouterWithHandler(t)
 
 	// Контракт фронтенда: POST /api/v1/avatars БЕЗ завершающего слэша.
 	// Проверяем, что маршрут существует и не редиректит (иначе был бы 301/404).

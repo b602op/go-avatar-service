@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
@@ -13,7 +14,12 @@ import (
 
 	"github.com/b602op/avatars-service/internal/config"
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/services/circuitbreaker"
 )
+
+// breakerFailuresToTrip — сколько неудач подряд открывают breaker клиента.
+// Держим синхронно с circuitbreaker.failuresToTrip (константа не экспортируется).
+const breakerFailuresToTrip = 5
 
 // testBucket возвращает имя тестового бакета (отдельно от рабочего).
 func testBucket() string {
@@ -171,4 +177,88 @@ func TestClient_HealthCheck(t *testing.T) {
 	missing, err := New(cfg, nil)
 	require.NoError(t, err)
 	assert.Error(t, missing.HealthCheck(ctx))
+}
+
+// deadEndpointClient — клиент на закрытом порту: хранилище гарантированно
+// недоступно, поэтому для проверки breaker'а не нужен ни compose, ни testcontainers.
+func deadEndpointClient(t *testing.T) *Client {
+	t.Helper()
+
+	cfg := testConfig()
+	// Порт 1 на loopback закрыт: соединение отклоняется сразу, без ожидания.
+	cfg.Endpoint = "127.0.0.1:1"
+
+	client, err := New(cfg, nil)
+	require.NoError(t, err)
+	return client
+}
+
+// deadCtx ограничивает вызов по времени: у minio-go есть внутренние ретраи, и
+// без дедлайна тест ждал бы их backoff.
+func deadCtx(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// Проверяет, что реальные операции клиента обёрнуты в breaker: после пяти
+// неудач подряд вызовы перестают уходить в хранилище.
+func TestClient_CircuitBreaker_OpensOnStorageFailure(t *testing.T) {
+	client := deadEndpointClient(t)
+	ctx := deadCtx(t)
+
+	for i := 0; i < breakerFailuresToTrip; i++ {
+		_, err := client.StatObject(ctx, "no/such/key")
+		require.Error(t, err, "вызов %d должен дойти до хранилища и упасть", i)
+		require.NotErrorIs(t, err, circuitbreaker.ErrCircuitOpen)
+	}
+
+	_, err := client.StatObject(ctx, "no/such/key")
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen)
+}
+
+func TestClient_CircuitBreaker_CoversAllOperations(t *testing.T) {
+	client := deadEndpointClient(t)
+	ctx := deadCtx(t)
+
+	// Открываем breaker одной операцией, затем проверяем остальные: состояние
+	// общее на клиента, поэтому все они должны коротко замкнуться.
+	for i := 0; i < breakerFailuresToTrip; i++ {
+		_, err := client.StatObject(ctx, "no/such/key")
+		require.Error(t, err)
+	}
+
+	content := []byte("x")
+
+	err := client.Upload(ctx, "k", bytes.NewReader(content), int64(len(content)), "")
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen, "Upload")
+
+	_, _, err = client.Download(ctx, "k")
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen, "Download")
+
+	err = client.Delete(ctx, "k")
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen, "Delete")
+
+	err = client.DeleteMany(ctx, []string{"k"})
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen, "DeleteMany")
+}
+
+// EnsureBucket и HealthCheck намеренно вне breaker'а: они должны честно
+// показывать состояние хранилища, а не «breaker открыт».
+func TestClient_HealthCheck_NotBehindBreaker(t *testing.T) {
+	client := deadEndpointClient(t)
+	ctx := deadCtx(t)
+
+	for i := 0; i < breakerFailuresToTrip+1; i++ {
+		_, err := client.StatObject(ctx, "no/such/key")
+		require.Error(t, err)
+	}
+
+	// Breaker открыт, но health-проверка всё равно идёт в хранилище и падает
+	// своей ошибкой, а не ErrCircuitOpen.
+	err := client.HealthCheck(ctx)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, circuitbreaker.ErrCircuitOpen)
 }

@@ -14,7 +14,7 @@ import (
 // Используется в clearEnv, чтобы каждый тест стартовал с чистого окружения.
 var allEnvKeys = []string{
 	"APP_ENV", "LOG_LEVEL",
-	"HTTP_PORT", "HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT",
+	"HTTP_PORT", "HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "RATE_LIMIT_RPS", "RATE_LIMIT_BURST",
 	"POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_SSLMODE",
 	"S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION", "S3_USE_SSL",
 	"RABBITMQ_URL", "RABBITMQ_EXCHANGE", "RABBITMQ_RETRY_TTL",
@@ -56,6 +56,46 @@ func TestLoad_MetricsAddr(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, ":19090", cfg.MetricsAddr)
+}
+
+func TestLoad_RateLimitDefaults(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Equal(t, 100.0, cfg.HTTP.RateLimitRPS)
+	assert.Equal(t, 200, cfg.HTTP.RateLimitBurst)
+}
+
+func TestLoad_RateLimit(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RATE_LIMIT_RPS", "12.5")
+	t.Setenv("RATE_LIMIT_BURST", "25")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Equal(t, 12.5, cfg.HTTP.RateLimitRPS)
+	assert.Equal(t, 25, cfg.HTTP.RateLimitBurst)
+}
+
+func TestLoad_RateLimitRPS_Invalid(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RATE_LIMIT_RPS", "много")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RATE_LIMIT_RPS")
+}
+
+func TestLoad_RateLimitBurst_Invalid(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RATE_LIMIT_BURST", "3.5")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RATE_LIMIT_BURST")
 }
 
 func TestLoad_RabbitMQRetryTTL(t *testing.T) {

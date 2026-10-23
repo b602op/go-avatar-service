@@ -17,10 +17,10 @@ import (
 // histogramSampleCount возвращает число наблюдений гистограммы с заданной меткой
 // status: testutil.ToFloat64 гистограммы не поддерживает, а счётчик наблюдений —
 // это ровно то, что нужно проверять в тестах.
-func histogramSampleCount(t *testing.T, name, status string) uint64 {
+func histogramSampleCount(t *testing.T, gatherer prometheus.Gatherer, name, status string) uint64 {
 	t.Helper()
 
-	families, err := prometheus.DefaultGatherer.Gather()
+	families, err := gatherer.Gather()
 	require.NoError(t, err)
 
 	for _, family := range families {
@@ -107,15 +107,18 @@ func TestFileSizeBuckets(t *testing.T) {
 // глобальном реестре под ожидаемыми именами и у них нет лейбла user_id
 // (кардинальность не должна расти вместе с числом пользователей).
 func TestBusinessMetricsRegistered(t *testing.T) {
-	// Векторные метрики появляются в выдаче только после первой записи.
-	AvatarsUploadsTotal.WithLabelValues(StatusSuccess).Inc()
-	AvatarsDeletesTotal.WithLabelValues(StatusSuccess).Inc()
-	AvatarsUploadDuration.WithLabelValues(StatusSuccess).Observe(0.1)
-	AvatarsProcessingDuration.WithLabelValues(StatusSuccess).Observe(0.1)
-	AvatarsFileSize.Observe(2048)
-	AvatarsStorageBytes.Set(0)
+	reg := prometheus.NewRegistry()
+	m := NewSet(reg)
 
-	families, err := prometheus.DefaultGatherer.Gather()
+	// Векторные метрики появляются в выдаче только после первой записи.
+	m.AvatarsUploadsTotal.WithLabelValues(StatusSuccess).Inc()
+	m.AvatarsDeletesTotal.WithLabelValues(StatusSuccess).Inc()
+	m.AvatarsUploadDuration.WithLabelValues(StatusSuccess).Observe(0.1)
+	m.AvatarsProcessingDuration.WithLabelValues(StatusSuccess).Observe(0.1)
+	m.AvatarsFileSize.Observe(2048)
+	m.AvatarsStorageBytes.Set(0)
+
+	families, err := reg.Gather()
 	require.NoError(t, err)
 
 	byName := make(map[string]*dto.MetricFamily, len(families))
@@ -160,16 +163,22 @@ func TestBusinessMetricsRegistered(t *testing.T) {
 // TestBusinessMetricsRecordObservations проверяет запись значений в метрики:
 // счётчик инкрементится, гистограмма накапливает наблюдения.
 func TestBusinessMetricsRecordObservations(t *testing.T) {
-	uploads := AvatarsUploadsTotal.WithLabelValues(StatusSuccess)
+	reg := prometheus.NewRegistry()
+	m := NewSet(reg)
+
+	uploads := m.AvatarsUploadsTotal.WithLabelValues(StatusSuccess)
+	// HistogramVec появляется в Gather только после создания серии; без этого
+	// первый замер до наблюдения не нашёл бы гистограмму.
+	m.AvatarsUploadDuration.WithLabelValues(StatusSuccess)
 
 	uploadsBefore := collectValue(t, uploads)
-	durationBefore := histogramSampleCount(t, MetricAvatarsUploadDuration, StatusSuccess)
+	durationBefore := histogramSampleCount(t, reg, MetricAvatarsUploadDuration, StatusSuccess)
 
 	uploads.Inc()
-	AvatarsUploadDuration.WithLabelValues(StatusSuccess).Observe(0.25)
+	m.AvatarsUploadDuration.WithLabelValues(StatusSuccess).Observe(0.25)
 
 	assert.Equal(t, uploadsBefore+1, collectValue(t, uploads))
-	assert.Equal(t, durationBefore+1, histogramSampleCount(t, MetricAvatarsUploadDuration, StatusSuccess))
+	assert.Equal(t, durationBefore+1, histogramSampleCount(t, reg, MetricAvatarsUploadDuration, StatusSuccess))
 }
 
 // TestStartStorageUpdater_StopsOnContextCancel проверяет, что фоновая горутина
@@ -187,10 +196,12 @@ func TestStartStorageUpdater_StopsOnContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 
+	m := NewSet(prometheus.NewRegistry())
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		StartStorageUpdater(ctx, pool, slog.New(slog.DiscardHandler))
+		m.StartStorageUpdater(ctx, pool, slog.New(slog.DiscardHandler))
 	}()
 
 	// Первый пересчёт выполняется сразу: даём горутине дойти до цикла.

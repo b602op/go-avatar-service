@@ -18,11 +18,16 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/b602op/avatars-service/internal/config"
+	"github.com/b602op/avatars-service/internal/services/circuitbreaker"
 )
 
 // rabbitURL — адрес RabbitMQ, поднятого один раз на весь пакет (TestMain).
 // Пустая строка означает, что контейнер недоступен: тесты скипаются.
 var rabbitURL string
+
+// breakerFailuresToTrip — сколько неудач подряд открывают breaker публикации.
+// Держим синхронно с circuitbreaker.failuresToTrip (константа не экспортируется).
+const breakerFailuresToTrip = 5
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -229,6 +234,29 @@ func TestNewRabbitMQ_InvalidURL(t *testing.T) {
 	// Недоступный порт: соединение не установится, конструктор вернёт ошибку.
 	_, err := NewRabbitMQ(config.RabbitMQConfig{URL: "amqp://guest:guest@127.0.0.1:1/", Exchange: "x"}, testLogger())
 	require.Error(t, err)
+}
+
+// TestRabbitMQPublisher_BreakerOpensOnPublishFailure проверяет, что публикация
+// обёрнута в breaker: после пяти неудач подряд вызовы не доходят до брокера.
+//
+// Закрытый канал — самый дешёвый способ получить деградацию брокера без
+// остановки контейнера: PublishWithContext сразу возвращает amqp.ErrClosed.
+func TestRabbitMQPublisher_BreakerOpensOnPublishFailure(t *testing.T) {
+	env := setupTest(t)
+
+	require.NoError(t, env.pub.channel.Close())
+
+	ctx := context.Background()
+	avatarID := uuid.New()
+
+	for i := 0; i < breakerFailuresToTrip; i++ {
+		err := env.pub.PublishAvatarUploaded(ctx, avatarID, "user-1", "originals/user-1/a/photo.jpg")
+		require.Error(t, err, "публикация %d должна упасть", i)
+		require.NotErrorIs(t, err, circuitbreaker.ErrCircuitOpen)
+	}
+
+	err := env.pub.PublishAvatarUploaded(ctx, avatarID, "user-1", "originals/user-1/a/photo.jpg")
+	assert.ErrorIs(t, err, circuitbreaker.ErrCircuitOpen)
 }
 
 func TestRabbitMQPublisher_DeclareIdempotent(t *testing.T) {

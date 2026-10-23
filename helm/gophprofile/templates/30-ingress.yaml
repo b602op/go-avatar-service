@@ -1,0 +1,36 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+Ingress для HTTP-сервера.
+
+Без TLS: сертификата в локальном стенде нет, а терминирование TLS в проде —
+задача ingress-контроллера и cert-manager, не чарта приложения.
+
+proxy-body-size: приложение отклоняет файлы больше 10 МБ, поэтому и прокси
+должен пропускать столько же — иначе клиент получит 413 от nginx, не дойдя до
+сервиса. Значение согласовано с services.MaxFileSize в Go-коде.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gophprofile-ingress
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: server
+                port:
+                  number: {{ .Values.server.service.port }}
+{{- end }}

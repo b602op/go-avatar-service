@@ -1,0 +1,86 @@
+{{- if .Values.migration.enabled }}
+{{/*
+Job применения миграций — Helm-хук.
+
+Хук повешен на post-install,pre-upgrade, а не на pre-install,pre-upgrade, как
+обычно делают. Причина: на первом install у pre-install хука ещё не существует
+ни ConfigMap, ни Secret, ни Service postgres — их создаёт сам релиз уже ПОСЛЕ
+хуков. Такой Job висел бы в Init:0/1 (initContainer ждёт postgres, которого нет)
+до таймаута хука, и helm install падал бы на чистом кластере. post-install
+выполняется после создания объектов релиза, поэтому initContainer может
+дождаться postgres, а envFrom — найти ConfigMap и Secret. На upgrade порядок
+остаётся правильным: pre-upgrade отрабатывает до обновления подов приложения.
+
+Секреты передаются через envFrom, а не значениями в спеке: иначе учётные данные
+дублировались бы в объекте Job и были бы видны в `kubectl get job -o yaml`.
+Обратная сторона pre-upgrade — Job берёт Secret в его текущем (до обновления)
+виде; для миграций это не важно, они зависят только от соединения с БД.
+
+Сам режим живёт в Go-коде: cmd/server/main.go по MIGRATE_ONLY=true подключается
+к БД, применяет миграции и завершается, не поднимая HTTP-сервер и трейсинг.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gophprofile.fullname" . }}-migrate
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    # Отрицательный вес: если в чарте появятся другие post-install хуки,
+    # миграции должны отработать раньше них.
+    "helm.sh/hook-weight": "-5"
+    # Удалять Job перед повторным запуском хука и после успеха: иначе объекты
+    # копились бы при каждом upgrade. Падение Job (hook-failed) оставляет его
+    # для разбора — лог упавшей миграции нужен.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        app: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: gophprofile-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      initContainers:
+        # Миграция запускается сразу после создания объектов релиза, когда под
+        # postgres ещё поднимается (initdb на чистом томе — это секунды). Без
+        # ожидания Job просто падал бы с "connection refused".
+        - name: wait-postgres
+          image: busybox:1.36
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              until nc -w 2 postgres 5432 </dev/null; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+      containers:
+        - name: migrate
+          # Тот же образ, что у сервера: миграции встроены в бинарник через
+          # go:embed, отдельный образ для них не нужен.
+          image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: MIGRATE_ONLY
+              value: "true"
+          envFrom:
+            - configMapRef:
+                name: gophprofile-config
+            - secretRef:
+                name: {{ include "gophprofile.secretName" . }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+{{- end }}

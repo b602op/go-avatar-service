@@ -37,13 +37,14 @@ func counterValue(t *testing.T, c prometheus.Collector) float64 {
 // именно поэтому Upload возвращает именованные значения, и ошибка на любом
 // шаге (валидация, S3, БД) должна попадать в status="error".
 func TestUploadMetrics(t *testing.T) {
-	success := metrics.AvatarsUploadsTotal.WithLabelValues(metrics.StatusSuccess)
-	failed := metrics.AvatarsUploadsTotal.WithLabelValues(metrics.StatusError)
+	m := metrics.NewSet(prometheus.NewRegistry())
+	success := m.AvatarsUploadsTotal.WithLabelValues(metrics.StatusSuccess)
+	failed := m.AvatarsUploadsTotal.WithLabelValues(metrics.StatusError)
 
 	t.Run("success", func(t *testing.T) {
 		before := counterValue(t, success)
 
-		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil, m)
 		_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 		require.NoError(t, err)
 
@@ -53,7 +54,7 @@ func TestUploadMetrics(t *testing.T) {
 	t.Run("validation error", func(t *testing.T) {
 		before := counterValue(t, failed)
 
-		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil, m)
 		_, err := svc.Upload(context.Background(), "user-1", "bad.txt", "text/plain", []byte("hello"))
 		require.Error(t, err)
 
@@ -68,7 +69,7 @@ func TestUploadMetrics(t *testing.T) {
 				return errors.New("s3 down")
 			},
 		}
-		svc := NewAvatarService(&stubAvatarRepo{}, storage, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(&stubAvatarRepo{}, storage, &stubEventPublisher{}, nil, m)
 		_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 		require.Error(t, err)
 
@@ -79,8 +80,9 @@ func TestUploadMetrics(t *testing.T) {
 // TestDeleteMetrics проверяет, что удаление считается успешным только при
 // фактическом удалении: отказ по правам и отсутствие записи — это ошибки.
 func TestDeleteMetrics(t *testing.T) {
-	success := metrics.AvatarsDeletesTotal.WithLabelValues(metrics.StatusSuccess)
-	failed := metrics.AvatarsDeletesTotal.WithLabelValues(metrics.StatusError)
+	m := metrics.NewSet(prometheus.NewRegistry())
+	success := m.AvatarsDeletesTotal.WithLabelValues(metrics.StatusSuccess)
+	failed := m.AvatarsDeletesTotal.WithLabelValues(metrics.StatusError)
 
 	t.Run("success", func(t *testing.T) {
 		before := counterValue(t, success)
@@ -91,7 +93,7 @@ func TestDeleteMetrics(t *testing.T) {
 				return &domain.Avatar{ID: id, UserID: "user-1"}, nil
 			},
 		}
-		svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil, m)
 		require.NoError(t, svc.Delete(context.Background(), id, "user-1"))
 
 		assert.Equal(t, before+1, counterValue(t, success))
@@ -106,7 +108,7 @@ func TestDeleteMetrics(t *testing.T) {
 				return &domain.Avatar{ID: id, UserID: "owner"}, nil
 			},
 		}
-		svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil, m)
 
 		err := svc.Delete(context.Background(), id, "intruder")
 		require.ErrorIs(t, err, domain.ErrForbidden)
@@ -117,7 +119,7 @@ func TestDeleteMetrics(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		before := counterValue(t, failed)
 
-		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+		svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil, m)
 
 		err := svc.Delete(context.Background(), uuid.New(), "user-1")
 		require.ErrorIs(t, err, domain.ErrNotFound)

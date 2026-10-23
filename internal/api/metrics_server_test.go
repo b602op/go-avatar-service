@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -15,10 +16,10 @@ import (
 
 // testMetricsServer поднимает хендлер сервера метрик на случайном порту.
 // Сам *http.Server здесь не нужен: тестируется маршрутизация /metrics и /health.
-func testMetricsServer(t *testing.T, withHealth bool) *httptest.Server {
+func testMetricsServer(t *testing.T, withHealth bool, m *metrics.Set) *httptest.Server {
 	t.Helper()
 
-	srv := NewMetricsServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)), withHealth)
+	srv := NewMetricsServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)), withHealth, m)
 	ts := httptest.NewServer(srv.Handler)
 	t.Cleanup(ts.Close)
 
@@ -45,12 +46,13 @@ func get(t *testing.T, ts *httptest.Server, path string) (int, string) {
 // TestMetricsServer_ExposesMetrics проверяет, что /metrics отдаёт метрики в
 // формате Prometheus, включая наши HTTP-метрики.
 func TestMetricsServer_ExposesMetrics(t *testing.T) {
-	ts := testMetricsServer(t, false)
+	m := metrics.NewSet(prometheus.NewRegistry())
+	ts := testMetricsServer(t, false, m)
 
 	// Векторные метрики попадают в выдачу только после первого наблюдения:
 	// без этого /metrics содержал бы лишь runtime-метрики Go.
-	metrics.HTTPRequestsTotal.WithLabelValues(http.MethodGet, "/test", "200").Inc()
-	metrics.HTTPRequestDuration.WithLabelValues(http.MethodGet, "/test", "200").Observe(0.01)
+	m.HTTPRequestsTotal.WithLabelValues(http.MethodGet, "/test", "200").Inc()
+	m.HTTPRequestDuration.WithLabelValues(http.MethodGet, "/test", "200").Observe(0.01)
 
 	status, body := get(t, ts, "/metrics")
 
@@ -61,7 +63,7 @@ func TestMetricsServer_ExposesMetrics(t *testing.T) {
 
 // TestMetricsServer_Health проверяет liveness-эндпоинт воркера.
 func TestMetricsServer_Health(t *testing.T) {
-	ts := testMetricsServer(t, true)
+	ts := testMetricsServer(t, true, metrics.NewSet(prometheus.NewRegistry()))
 
 	status, body := get(t, ts, "/health")
 
@@ -73,7 +75,7 @@ func TestMetricsServer_Health(t *testing.T) {
 // у него уже есть полноценный /health в основном роутере, проверяющий
 // зависимости. Вспомогательный сервер не должен его подменять.
 func TestMetricsServer_HealthDisabled(t *testing.T) {
-	ts := testMetricsServer(t, false)
+	ts := testMetricsServer(t, false, metrics.NewSet(prometheus.NewRegistry()))
 
 	status, _ := get(t, ts, "/health")
 

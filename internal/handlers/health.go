@@ -108,6 +108,30 @@ func Health(
 	}
 }
 
+// liveResponse — тело ответа /live.
+type liveResponse struct {
+	Status string `json:"status"`
+}
+
+// Live отдаёт 200, если процесс жив и обслуживает HTTP.
+//
+// Зависимости здесь НЕ проверяются намеренно — в этом весь смысл эндпоинта.
+// /health отвечает на вопрос «можно ли направлять сюда трафик» (и потому
+// опрашивает БД, S3 и брокер), а /live — на вопрос «нужно ли перезапускать
+// процесс». Смешивать их нельзя: если liveness-проба опрашивает зависимость,
+// её падение превращается в перезапуск пода, который ничего не лечит — процесс
+// жив, а после рестарта приложение падает на старте (EnsureBucket идёт в
+// недоступный S3) и уходит в CrashLoopBackOff.
+//
+// По той же причине у /live нет ни таймаута, ни внешних вызовов: ответ обязан
+// быть мгновенным и безусловным, иначе проба сама станет источником ложных
+// перезапусков.
+func Live(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"` + statusOK + `"}`))
+}
+
 // overallStatus сводит состояния компонентов к общему статусу и HTTP-коду.
 func overallStatus(components map[string]ComponentStatus) (string, int) {
 	okCount := 0

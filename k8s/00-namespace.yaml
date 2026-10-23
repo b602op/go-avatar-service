@@ -1,0 +1,9 @@
+# Namespace всего стека GophProfile.
+#
+# Отдельный namespace, а не default: все объекты приложения (поды, сервисы,
+# PVC, секреты) изолированы от системных и легко удаляются одним действием
+# (kubectl delete ns gophprofile).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gophprofile

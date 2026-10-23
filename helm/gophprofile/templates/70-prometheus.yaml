@@ -1,0 +1,149 @@
+{{- if .Values.prometheus.enabled }}
+{{/*
+Prometheus со static config: ConfigMap + Deployment + Service.
+
+Нужен, чтобы метрики server:9090 и worker:9091 собирались в кластере без
+Prometheus Operator: ServiceMonitor — CRD, а kube-prometheus-stack требует
+2-3 GB RAM и не влезает в ноду minikube. В проде чарт обычно ставится с
+prometheus.enabled=false, а сбор идёт через ServiceMonitor.
+
+Цели — headless Service'ы server-metrics и worker-metrics (см. templates/
+20-server.yaml и 21-worker.yaml): Prometheus разрешает их DNS-имена в IP подов
+и скрейпит каждую реплику отдельно. Это возможно и без оператора, потому что
+dns_sd_configs есть в самом Prometheus.
+
+Ограничения по сравнению с ServiceMonitor (осознанные):
+  * нет service discovery по меткам: список headless Service'ов фиксирован в
+    prometheus.yml, новый компонент требует правки ConfigMap;
+  * нет метки pod: серии различаются по instance (IP:порт), а не по имени пода;
+  * данные не персистятся (emptyDir, retention 6h) — это стенд для проверки
+    сбора метрик, а не долговременное хранилище.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    app: prometheus
+    {{- include "gophprofile.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: {{ .Values.prometheus.scrapeInterval }}
+      evaluation_interval: {{ .Values.prometheus.scrapeInterval }}
+
+    scrape_configs:
+      # Цели — headless Service'ы server-metrics / worker-metrics: DNS отдаёт
+      # по A-записи на каждый под, поэтому Prometheus скрейпит все реплики
+      # отдельно. Ссылка на обычный Service дала бы одну цель на балансировщик:
+      # скрейпы попадали бы в случайный под, и бизнес-метрики одного пода
+      # затирались бы нулями другого.
+      # Порты совпадают с server.metricsAddr / worker.metricsAddr.
+      - job_name: server
+        dns_sd_configs:
+          - names:
+              - server-metrics.{{ include "gophprofile.namespace" . }}.svc.cluster.local
+            type: A
+            port: 9090
+      - job_name: worker
+        dns_sd_configs:
+          - names:
+              - worker-metrics.{{ include "gophprofile.namespace" . }}.svc.cluster.local
+            type: A
+            port: 9091
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    app: prometheus
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        {{- include "gophprofile.labels" . | nindent 8 }}
+      annotations:
+        # Prometheus читает prometheus.yml только на старте, а ConfigMap в поде
+        # обновляется без рестарта. Без этой аннотации правка целей применялась
+        # бы лишь после ручного rollout restart.
+        checksum/prometheus-config: {{ printf "%v-%s" .Values.prometheus (include "gophprofile.namespace" .) | sha256sum }}
+    spec:
+      # Kubernetes API Prometheus не нужен (static config), токен не монтируем.
+      serviceAccountName: gophprofile-sa
+      securityContext:
+        runAsNonRoot: true
+        # Образ prom/prometheus штатно работает от nobody (65534).
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: "{{ .Values.prometheus.image.repository }}:{{ .Values.prometheus.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.prometheus.retention }}
+            - --web.listen-address=:9090
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.prometheus.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    app: prometheus
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+{{- end }}

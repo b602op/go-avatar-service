@@ -1,0 +1,104 @@
+{{/*
+MinIO (S3-совместимое хранилище): StatefulSet с локальным PVC + headless Service.
+
+Как и postgres — StatefulSet: бакеты и объекты лежат на томе, который должен
+переживать пересоздание пода. Образ pgsty/silo — тот же, что в
+docker-compose.yml, чтобы локальный запуск и кластер вели себя одинаково.
+
+args, а НЕ command: в Kubernetes command перекрывает ENTRYPOINT образа, а у silo
+это скрипт docker-entrypoint.sh, раскрывающий legacy-имя подкоманды `server` в
+бинарник silo. С command контейнер падал с "exec: \"server\": executable file not
+found in $PATH" (в compose `command:` задаёт CMD, то есть аргументы entrypoint'а).
+
+Капабилити: полный drop ALL — этот образ привилегий не сбрасывает и остаётся
+root внутри контейнера, поэтому подготовки тома от root, как у postgres и
+rabbitmq, ему не требуется.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 4 }}
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 4 }}
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: {{ include "gophprofile.namespace" . }}
+  labels:
+    {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 4 }}
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gophprofile.selectorLabels" (dict "component" "minio") | nindent 8 }}
+        {{- include "gophprofile.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: gophprofile-db-sa
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: "{{ .Values.minio.image.repository }}:{{ .Values.minio.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD — учётные данные, которые
+          # хранилище заводит при первой инициализации тома.
+          envFrom:
+            - secretRef:
+                name: {{ include "gophprofile.secretName" . }}
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # /minio/health/live — liveness-эндпоинт хранилища: отвечает, пока
+          # процесс обслуживает S3 API.
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.minio.storage }}

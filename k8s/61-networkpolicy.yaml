@@ -1,0 +1,250 @@
+# Сетевая сегментация: каждому компоненту разрешено ровно то, что он реально
+# использует. Логика — default deny + явные разрешения: как только у пода
+# появляется хотя бы одна политика с policyTypes: Ingress, весь входящий трафик,
+# не описанный в правилах, отбрасывается (то же для Egress).
+#
+# Три уровня доступа:
+#   * server   — снаружи только от ingress-контроллера, наружу только к своим
+#                зависимостям и DNS;
+#   * worker   — снаружи только порт метрик (его скрейпит Prometheus), наружу
+#                только к зависимостям и DNS;
+#   * postgres / minio / rabbitmq — снаружи только от server и worker.
+#
+# Метрики (server:9090, worker:9091) открыты только источникам сбора:
+#   * поду с меткой app: prometheus — это Prometheus со static config из
+#     70-prometheus.yaml, он живёт в этом же namespace и скрейпит оба порта;
+#   * namespace monitoring — Prometheus Operator из kube-prometheus-stack
+#     (прод-вариант, см. 50-servicemonitor.yaml).
+#
+# Чего в политиках НЕТ осознанно:
+#   * отдельного правила «DNS наружу»: приложению нужен только кластерный
+#     резолвер (kube-system:53), внешние DNS ему не нужны — значит, и разрешать
+#     их незачем;
+#   * egress у БД и брокера: политика для них задаёт только Ingress, поэтому
+#     исходящий трафик у них не ограничен. Им нужны ответы на входящие
+#     соединения (они не зависят от egress-правил — ответы идут по уже
+#     установленным соединениям) и ничего больше; ограничивать их egress
+#     имеет смысл только если понадобится полностью изолировать хранилища.
+#
+# Проверено на локальном стенде (CNI kindnet, minikube v1.39): политики
+# действительно фильтруют трафик, а не просто лежат в API. Что наблюдалось:
+#   * под в namespace default → server:8080 — соединение отклонено;
+#   * под в gophprofile без меток app → postgres:5432, minio:9000, rabbitmq:5672
+#     — отклонены, server:8080 — отклонён;
+#   * под с меткой app=worker → postgres/minio/rabbitmq доступны, server:8080
+#     недоступен (в его ingress-правиле источник — только ingress-nginx);
+#   * server:9090 и worker:9091 — доступны из namespace monitoring и
+#     недоступны из default; скрейп из пода app=prometheus проверен по факту
+#     (Prometheus → /targets: оба джоба UP, см. README).
+# Ранние версии CNI в kind/minikube NetworkPolicy не реализовывали, поэтому
+# проверку стоит повторять после смены CNI: политика без реализации не даёт
+# ошибки, она просто ничего не делает.
+---
+# ─── server ─────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: server-ingress
+  namespace: gophprofile
+spec:
+  podSelector:
+    matchLabels:
+      app: server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Пользовательский трафик приходит только через Ingress (30-ingress.yaml):
+    # ingress-контроллер ходит в поды напрямую по ClusterIP, поэтому источник
+    # трафика — поды в namespace ingress-nginx, а не внешние адреса.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # kubernetes.io/metadata.name проставляет сам Kubernetes каждому
+              # namespace (автоматическая метка с его именем), так что
+              # дополнительно помечать ingress-nginx не требуется.
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+    # Метрики: Prometheus со static config (app: prometheus, этот же namespace)
+    # и — в проде — Prometheus Operator из namespace monitoring.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - port: 5672
+          protocol: TCP
+    # DNS: CoreDNS живёт в kube-system, порт 53 — и UDP, и TCP (UDP для
+    # обычных запросов, TCP для ответов, не влезших в UDP, и для zone transfer).
+    # Правило с одним UDP оставило бы редкие крупные ответы без резолва.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# ─── worker ─────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-ingress
+  namespace: gophprofile
+spec:
+  podSelector:
+    matchLabels:
+      app: worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # У воркера нет пользовательского трафика: открыт только порт метрик,
+    # причём только источникам сбора (static Prometheus и оператор).
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9091
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - port: 5672
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# ─── postgres ───────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: gophprofile
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    # Оба элемента в одном `from`: правила объединяются по ИЛИ, то есть
+    # допускается и server, и worker. Отдельные записи в списке `from` с одним
+    # портом тоже сработали бы, но здесь порт общий, поэтому короче так.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# ─── minio ──────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minio-ingress
+  namespace: gophprofile
+spec:
+  podSelector:
+    matchLabels:
+      app: minio
+  policyTypes:
+    - Ingress
+  ingress:
+    # Только S3 API (9000). Консоль (9001) и метрики (15692 у RabbitMQ)
+    # наружу не открываются: в кластере их никто не использует.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 9000
+          protocol: TCP
+---
+# ─── rabbitmq ───────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq-ingress
+  namespace: gophprofile
+spec:
+  podSelector:
+    matchLabels:
+      app: rabbitmq
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: server
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 5672
+          protocol: TCP

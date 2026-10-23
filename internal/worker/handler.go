@@ -45,14 +45,30 @@ type Handler struct {
 	storage domain.ObjectStorage
 	resizer Resizer
 	log     *slog.Logger
+	metrics *metrics.Set
 }
 
 // NewHandler создаёт обработчик событий.
-func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger) *Handler {
+//
+// m обязателен: обработчик пишет метрики длительности обработки, и тихий
+// fallback на глобальный реестр скрывал бы забытую зависимость. nil — ошибка
+// программиста, поэтому паника.
+func NewHandler(repo domain.AvatarRepository, storage domain.ObjectStorage, rz Resizer, log *slog.Logger, m *metrics.Set) *Handler {
+	if m == nil {
+		panic("worker: NewHandler: metrics is nil")
+	}
+
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Handler{repo: repo, storage: storage, resizer: rz, log: log}
+
+	return &Handler{
+		repo:    repo,
+		storage: storage,
+		resizer: rz,
+		log:     log,
+		metrics: m,
+	}
 }
 
 // HandleUpload создаёт миниатюры для загруженной аватарки и сохраняет их в S3.
@@ -68,7 +84,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 	start := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
-			metrics.AvatarsProcessingDuration.WithLabelValues(metrics.StatusPanic).
+			h.metrics.AvatarsProcessingDuration.WithLabelValues(metrics.StatusPanic).
 				Observe(time.Since(start).Seconds())
 			panic(r)
 		}
@@ -77,7 +93,7 @@ func (h *Handler) HandleUpload(ctx context.Context, event publisher.AvatarUpload
 		if err != nil {
 			status = metrics.StatusError
 		}
-		metrics.AvatarsProcessingDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
+		h.metrics.AvatarsProcessingDuration.WithLabelValues(status).Observe(time.Since(start).Seconds())
 	}()
 
 	avatarID, err := uuid.Parse(event.AvatarID)

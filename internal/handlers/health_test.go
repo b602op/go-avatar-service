@@ -225,3 +225,32 @@ func TestHealth_Timeout(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, healthTimeout)
 	assert.Less(t, elapsed, healthTimeout+2*time.Second)
 }
+
+// ─── /live ──────────────────────────────────────────────────────────────────
+
+func TestLive_ReturnsOK(t *testing.T) {
+	rec := httptest.NewRecorder()
+	Live(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+	var resp liveResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, statusOK, resp.Status)
+}
+
+// TestLive_IgnoresContext проверяет главное свойство /live: ответ не зависит ни
+// от контекста, ни от состояния зависимостей. Если бы liveness-проба могла
+// «упасть» по внешней причине, она перезапускала бы здоровый под.
+func TestLive_IgnoresContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/live", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	Live(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}

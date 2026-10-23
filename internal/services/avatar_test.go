@@ -10,11 +10,19 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/b602op/avatars-service/internal/domain"
+	"github.com/b602op/avatars-service/internal/metrics"
 )
+
+// testMetrics возвращает набор метрик с отдельным реестром: тесты не делят
+// наблюдения друг с другом и не трогают глобальный реестр Prometheus.
+func testMetrics() *metrics.Set {
+	return metrics.NewSet(prometheus.NewRegistry())
+}
 
 // newBufferLogger возвращает логгер, пишущий в buf: тесты проверяют, что сбой
 // не остался незамеченным, а попал в лог на нужном уровне.
@@ -26,7 +34,7 @@ func TestAvatarService_Upload_Success(t *testing.T) {
 	repo := &stubAvatarRepo{}
 	storage := &stubObjectStorage{}
 	pub := &stubEventPublisher{}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	got, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 	require.NoError(t, err)
@@ -55,7 +63,7 @@ func TestAvatarService_Upload_Success(t *testing.T) {
 }
 
 func TestAvatarService_Upload_InvalidFormat(t *testing.T) {
-	svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil, testMetrics())
 
 	_, err := svc.Upload(context.Background(), "user-1", "bad.txt", "text/plain", []byte("hello"))
 	require.Error(t, err)
@@ -66,7 +74,7 @@ func TestAvatarService_Upload_FileTooLarge(t *testing.T) {
 	data := make([]byte, MaxFileSize+1)
 	copy(data, jpegData)
 
-	svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(&stubAvatarRepo{}, &stubObjectStorage{}, &stubEventPublisher{}, nil, testMetrics())
 
 	_, err := svc.Upload(context.Background(), "user-1", "big.jpg", mimeJPEG, data)
 	require.Error(t, err)
@@ -82,7 +90,7 @@ func TestAvatarService_Upload_StorageFails(t *testing.T) {
 		},
 	}
 	pub := &stubEventPublisher{}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 	require.Error(t, err)
@@ -103,7 +111,7 @@ func TestAvatarService_Upload_PublishFails(t *testing.T) {
 		},
 	}
 	var logs bytes.Buffer
-	svc := NewAvatarService(repo, storage, pub, newBufferLogger(&logs))
+	svc := NewAvatarService(repo, storage, pub, newBufferLogger(&logs), testMetrics())
 
 	// Публикация — best-effort: загрузка считается успешной.
 	got, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
@@ -140,7 +148,7 @@ func TestAvatarService_Upload_RepoCreateFails(t *testing.T) {
 		},
 	}
 	pub := &stubEventPublisher{}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 	require.Error(t, err)
@@ -169,7 +177,7 @@ func TestAvatarService_Upload_RepoCreateFails_CompensationFails(t *testing.T) {
 		},
 	}
 	var logs bytes.Buffer
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, newBufferLogger(&logs))
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, newBufferLogger(&logs), testMetrics())
 
 	_, err := svc.Upload(context.Background(), "user-1", "photo.jpg", mimeJPEG, jpegData)
 
@@ -209,7 +217,7 @@ func TestAvatarService_GetContent_Original(t *testing.T) {
 					return body, &domain.ObjectInfo{Key: key, Size: 7}, nil
 				},
 			}
-			svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+			svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil, testMetrics())
 
 			rc, info, err := svc.GetContent(context.Background(), avatar.ID, size)
 			require.NoError(t, err)
@@ -239,7 +247,7 @@ func TestAvatarService_GetContent_KeepsStorageContentType(t *testing.T) {
 				&domain.ObjectInfo{Key: key, Size: 7, ContentType: "image/png"}, nil
 		},
 	}
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil, testMetrics())
 
 	rc, info, err := svc.GetContent(context.Background(), avatar.ID, sizeOriginal)
 	require.NoError(t, err)
@@ -272,7 +280,7 @@ func TestAvatarService_GetContent_Thumbnail(t *testing.T) {
 			return body, &domain.ObjectInfo{Key: key, Size: 5}, nil
 		},
 	}
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil, testMetrics())
 
 	rc, info, err := svc.GetContent(context.Background(), avatar.ID, "100x100")
 	require.NoError(t, err)
@@ -303,7 +311,7 @@ func TestAvatarService_GetContent_UnknownSize(t *testing.T) {
 			return nil, nil, nil
 		},
 	}
-	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, storage, &stubEventPublisher{}, nil, testMetrics())
 
 	_, _, err := svc.GetContent(context.Background(), avatar.ID, "500x500")
 	require.Error(t, err)
@@ -316,7 +324,7 @@ func TestAvatarService_GetContent_NotFound(t *testing.T) {
 			return nil, domain.ErrNotFound
 		},
 	}
-	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil, testMetrics())
 
 	_, _, err := svc.GetContent(context.Background(), uuid.New(), sizeOriginal)
 	require.Error(t, err)
@@ -340,7 +348,7 @@ func TestAvatarService_Delete_Success(t *testing.T) {
 	}
 	storage := &stubObjectStorage{}
 	pub := &stubEventPublisher{}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	err := svc.Delete(context.Background(), avatar.ID, "user-1")
 	require.NoError(t, err)
@@ -370,7 +378,7 @@ func TestAvatarService_Delete_Forbidden(t *testing.T) {
 	}
 	storage := &stubObjectStorage{}
 	pub := &stubEventPublisher{}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	err := svc.Delete(context.Background(), avatar.ID, "user-2")
 	require.Error(t, err)
@@ -388,7 +396,7 @@ func TestAvatarService_Delete_NotFound(t *testing.T) {
 			return nil, domain.ErrNotFound
 		},
 	}
-	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil)
+	svc := NewAvatarService(repo, &stubObjectStorage{}, &stubEventPublisher{}, nil, testMetrics())
 
 	err := svc.Delete(context.Background(), uuid.New(), "user-1")
 	require.Error(t, err)
@@ -410,7 +418,7 @@ func TestAvatarService_Delete_PublishFails(t *testing.T) {
 			return pubErr
 		},
 	}
-	svc := NewAvatarService(repo, storage, pub, nil)
+	svc := NewAvatarService(repo, storage, pub, nil, testMetrics())
 
 	err := svc.Delete(context.Background(), avatar.ID, "user-1")
 	require.Error(t, err)

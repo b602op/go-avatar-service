@@ -1,0 +1,227 @@
+# HTTP-сервер: Deployment на 2 реплики.
+#
+# Deployment, а не StatefulSet: сервер не хранит состояние — метаданные в
+# PostgreSQL, файлы в S3. Реплики взаимозаменяемы, поэтому достаточно обычного
+# Service с балансировкой.
+#
+# Миграции каждая реплика применяет при старте сама (internal/migrator).
+# Одновременный старт безопасен: goose берёт session-level advisory lock,
+# поэтому второй под просто ждёт, пока первый закончит.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: gophprofile
+  labels:
+    app: server
+spec:
+  selector:
+    app: server
+  ports:
+    # 80 → 8080: снаружи удобнее обращаться к сервису по стандартному порту
+    # (Ingress на Шаге 1.2 будет целиться именно в него).
+    - name: http
+      port: 80
+      targetPort: 8080
+    # Метрики отдельным портом: их скрейпит Prometheus (70-prometheus.yaml),
+    # а не пользовательский трафик.
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+# Headless Service только для сбора метрик: DNS отдаёт по A-записи на каждый
+# под, поэтому Prometheus скрейпит все реплики, а не случайную через
+# балансировщик.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-metrics
+  namespace: gophprofile
+spec:
+  clusterIP: None
+  selector:
+    app: server
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  namespace: gophprofile
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: server
+  template:
+    metadata:
+      labels:
+        app: server
+    spec:
+      # SA с automountServiceAccountToken: false (60-serviceaccount.yaml):
+      # приложению Kubernetes API не нужен, поэтому токен в под не монтируется.
+      serviceAccountName: gophprofile-sa
+      # Пользователь и группа заданы явно, а не наследуются из образа. В образе
+      # это uid 100 (adduser -S app в Dockerfile), но полагаться на конкретный
+      # uid базового образа не стоит: при смене базового слоя он поменяется, а
+      # приложение от этого падать не должно — ему важна не личность, а
+      # непривилегированность. runAsNonRoot: true дополнительно заставляет
+      # kubelet отказать в запуске, если uid окажется нулевым.
+      #
+      # fsGroup на подах без томов ни на что не влияет — оставлен для
+      # единообразия с инфраструктурными подами и на случай, если понадобится
+      # смонтировать emptyDir (kubelet выдаст ему группу 1000 с правом записи).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      # Graceful shutdown: kubelet сначала выполняет preStop, и только потом
+      # отправляет SIGTERM, а через terminationGracePeriodSeconds убивает под
+      # SIGKILL. 30 секунд с запасом покрывают паузу preStop (5s) и догрузку
+      # in-flight запросов (верхняя граница обработки — middleware.Timeout, 30s).
+      terminationGracePeriodSeconds: 30
+      # Аналог `depends_on: {condition: service_healthy}` из docker-compose.yml.
+      # В Kubernetes такого условия нет, а приложение не ретраит подключения:
+      # если брокер или хранилище ещё не принимают соединения, процесс падает
+      # на старте и уходит в CrashLoopBackOff. RabbitMQ поднимается ~35 секунд,
+      # поэтому при первом `kubectl apply` это гарантированный сценарий.
+      #
+      # Проверка через nc, а не через HTTP: она одинаково работает для AMQP
+      # (5672) и S3 (9000), которым health-эндпоинты не нужны.
+      initContainers:
+        - name: wait-for-dependencies
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for target in postgres:5432 minio:9000 rabbitmq:5672; do
+                host=${target%:*}
+                port=${target#*:}
+                until nc -w 2 "$host" "$port" </dev/null; do
+                  echo "waiting for $host:$port"
+                  sleep 2
+                done
+                echo "$host:$port is ready"
+              done
+      containers:
+        - name: server
+          image: gophprofile-server:latest
+          # Образы собираются локально (Dockerfile, target server) и загружаются
+          # в кластер — minikube image load gophprofile-server:latest. В реестр
+          # за ними ходить не нужно: Always заставлял бы kubelet каждый раз
+          # пытаться скачать их из Docker Hub.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+            - containerPort: 9090
+          # Graceful shutdown, шаг 1: пауза перед SIGTERM. К моменту остановки
+          # процесса под уже должен быть исключён из Endpoints сервиса, иначе
+          # запросы, попавшие в окно между удалением из Endpoints и SIGTERM,
+          # рвутся. kube-proxy замечает изменение Endpoints асинхронно, поэтому
+          # без паузы клиенты получают ошибки соединения на каждом рестарте.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          # Несекретная конфигурация + учётные данные. Значения из env ниже
+          # переопределяют одноимённые ключи secretRef (POSTGRES_* и S3_*),
+          # чтобы явно было видно, что именно нужно приложению.
+          envFrom:
+            - configMapRef:
+                name: gophprofile-config
+            - secretRef:
+                name: gophprofile-secrets
+          env:
+            - name: HTTP_PORT
+              value: "8080"
+            # Воркер использует :9091, поэтому у сервера метрики остаются на
+            # дефолтном :9090 — иначе два процесса в одном поде конфликтовали бы
+            # (в кластере это разные Deployment'ы, но адрес задан явно).
+            - name: METRICS_ADDR
+              value: ":9090"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: POSTGRES_DB
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: S3_SECRET_KEY
+            # URL брокера содержит пароль, поэтому живёт в Secret, а не в
+            # ConfigMap.
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gophprofile-secrets
+                  key: RABBITMQ_URL
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          # Запуск не-рутовым процессом: эскалация привилегий запрещена (иначе
+          # setuid-бинарник в образе вернул бы root), Linux-капабилити не нужны
+          # вообще — сервер слушает 8080/9090 (порты > 1024, привилегий не
+          # требуют) и не работает с сетью на уровне сокетов/маршрутов.
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Корневая ФС только для чтения. Проверено по коду: приложение
+            # ничего не пишет на диск — временных файлов нет (os.CreateTemp /
+            # os.TempDir / MkdirAll в коде отсутствуют), картинки обрабатываются
+            # в памяти, всё остальное уходит в S3 и PostgreSQL. Если однажды
+            # появится запись во временный каталог, потребуется смонтировать
+            # emptyDir в /tmp (см. docs/tech-debt.md).
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          # Две разные пробы с разными вопросами — не перепутать:
+          #
+          #  liveness (/live)  — «процесс жив?». Зависимости не проверяются,
+          #      ответ безусловный. Падение S3/БД/брокера НЕ должно перезапускать
+          #      под: процесс жив, а старт приложения требует доступного S3
+          #      (EnsureBucket без ретраев), поэтому рестарт ведёт в
+          #      CrashLoopBackOff и не лечит ничего.
+          #
+          #  readiness (/health) — «можно ли направлять сюда трафик?». Опрашивает
+          #      БД, S3 и брокер: 200 — всё в порядке, 503 — часть зависимостей
+          #      недоступна. Пока так, под исключён из Endpoints, но продолжает
+          #      работать, и возвращается в балансировку сам, когда зависимости
+          #      поднимутся.
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5

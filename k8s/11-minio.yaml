@@ -1,0 +1,102 @@
+# MinIO (S3-совместимое хранилище): StatefulSet с локальным PVC.
+#
+# Как и postgres — StatefulSet: бакеты и объекты лежат на томе, который должен
+# переживать пересоздание пода. Service headless: приложение обращается к
+# minio:9000, а DNS ведёт на IP единственной реплики.
+#
+# Образ pgsty/silo — MinIO-совместимый сервер (тот же, что в docker-compose.yml),
+# чтобы локальный запуск и кластер вели себя одинаково.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: gophprofile
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: gophprofile
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      # См. комментарий в 10-postgres.yaml: инфраструктурный SA, fsGroup для тома.
+      serviceAccountName: gophprofile-db-sa
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: pgsty/silo:latest
+          # args, а НЕ command: в Kubernetes command перекрывает ENTRYPOINT образа,
+          # а у silo это скрипт docker-entrypoint.sh, который раскрывает legacy-имя
+          # подкоманды `server` в бинарник silo. С command контейнер падал с
+          # "exec: \"server\": executable file not found in $PATH".
+          # В docker-compose.yml этому соответствует `command:`, потому что там
+          # command задаёт CMD, то есть аргументы entrypoint'а.
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD — учётные данные, которые
+          # хранилище заводит при первой инициализации тома.
+          envFrom:
+            - secretRef:
+                name: gophprofile-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # readOnlyRootFilesystem не включается: хранилищу нужен записываемый
+          # том, а его собственные временные каталоги лежат вне /data.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          # /minio/health/live — liveness-эндпоинт самого хранилища: отвечает,
+          # пока процесс обслуживает S3 API.
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

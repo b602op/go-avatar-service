@@ -1,0 +1,13 @@
+apiVersion: v2
+name: gophprofile
+description: GophProfile avatar service with observability
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - avatars
+  - go
+  - observability
+maintainers:
+  - name: b602op
+    email: b602op@example.com
